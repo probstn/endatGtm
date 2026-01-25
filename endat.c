@@ -10,6 +10,7 @@
 #define TX_PIN    IfxGtm_ATOM0_1_TOUT1_P02_1_OUT
 #define DIR_PIN   IfxGtm_ATOM0_2_TOUT2_P02_2_OUT
 #define RX_PIN  IfxGtm_TIM0_0_P02_0_IN
+#define DEBUG_PIN IfxGtm_ATOM0_3_TOUT3_P02_3_OUT
 
 #define DATA_CMU 0
 #define CLOCK_CMU 1
@@ -26,7 +27,6 @@ static void initClock(void)
     Ifx_GTM_ATOM *atom = &gtm->ATOM[CLOCK_PIN.atom];
     Ifx_GTM_ATOM_AGC *agc  = &atom->AGC;
 
-    IfxGtm_PinMap_setAtomTout(&CLOCK_PIN, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
 
     atom->CH0.CTRL.B.MODE      = 2;   // SOMP
     atom->CH0.CTRL.B.SL        = 0;
@@ -79,8 +79,6 @@ static void initDir(void)
     Ifx_GTM_ATOM *atom = &gtm->ATOM[DIR_PIN.atom];
     Ifx_GTM_ATOM_AGC *agc  = &atom->AGC;
 
-    IfxGtm_PinMap_setAtomTout(&DIR_PIN, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
-
     // 1. Set Mode to SOMP (PWM) and Enable One-Shot Mode (OSM)
     atom->CH2.CTRL.B.MODE = 2;   // SOMP
     atom->CH2.CTRL.B.OSM  = 1;   // One-Shot Mode
@@ -112,53 +110,107 @@ static void initDir(void)
 
 static void initRx(void)
 {
-    Ifx_GTM_TIM *tim = &gtm->TIM[RX_PIN.tim];
+    Ifx_GTM_TIM *tim = &MODULE_GTM.TIM[0];
+
+    // Disable during config
+    tim->CH1.CTRL.B.TIM_EN = 0;
+
+    tim->CH1.CTRL.B.TIM_MODE = 0x6;     // TSSM
+    tim->CH1.CTRL.B.CLK_SEL  = 1;       // your CMU_CLK1 choice (baud clock)
+    tim->CH1.CNTS.U = 23;               // bits to shift (as you had)
+
+    // CH1 uses TIM_IN(x-1) => TIM_IN0 (same as RX pin on CH0)
+    tim->CH1.CTRL.B.CICTRL = 1;
+
+    // TSSM-specific meaning differs, but keep consistent with your setup
+    tim->CH1.CTRL.B.ISL = 0;
+    tim->CH1.CTRL.B.DSL = 1;
+
+    tim->CH1.IRQ.EN.B.NEWVAL_IRQ_EN = 1;
+    tim->CH1.IRQ.NOTIFY.B.NEWVAL    = 1;
+
+    // DO NOT enable yet. We will enable after TIEM triggers.
+}
+
+static void initRxStartBitDetector(void)
+{
+    Ifx_GTM_TIM *tim = &MODULE_GTM.TIM[0];
+
+    // Physical pin -> TIM0_CH0 input
     IfxGtm_PinMap_setTimTin(&RX_PIN, IfxPort_InputMode_pullUp);
 
-    // 1. Enable TIM Channel
-    tim->CH0.CTRL.B.TIM_EN = 1;
+    // 0) Make sure channel is disabled while configuring
+    tim->CH0.CTRL.B.TIM_EN = 0;
 
-    // 2. Set Mode to TSSM (TIM Serial Shift Mode) -> 0x6 (110b)
-    tim->CH0.CTRL.B.TIM_MODE = 0x6;
+    // 1) TIEM mode
+    tim->CH0.CTRL.B.TIM_MODE = 0x2;   // TIEM
 
-    // 3. Configure Internal Shift Clock
-    // We are NOT using an external clock pin, so we must match the Baud Rate using CMU_CLK.
-    // CLK_SEL = 1 selects CMU_CLK_1 (which we set to 100kHz in main)
-    tim->CH0.CTRL.B.CLK_SEL = 1;
+    // 2) Trigger on rising edge only
+    tim->CH0.CTRL.B.ISL = 0;          // use DSL
+    tim->CH0.CTRL.B.DSL = 1;          // rising edges are active
 
-    // 4. Configure TSSM Control (CNTS)
-    // [7:0]   = Word Length (Bits to shift before interrupt)
-    // [17:16] = Shift Clock Source (00 = Use CLK_SEL)
-    tim->CH0.CNTS.U = 23;
+    // 3) One-shot: stop after first active edge event
+    tim->CH0.CTRL.B.OSM = 1;
 
-    // 5. General Settings
-    tim->CH0.CTRL.B.ISL = 0; // Use input pin F_OUT for data
-    tim->CH0.CTRL.B.DSL = 1; // 1 = Shift Right (Matches TX SL=1)
+    // 4) Use the real input transitions (not external capture)
+    tim->CH0.CTRL.B.EXT_CAP_EN = 0;
 
-    // 6. Enable Interrupt Notification for New Value
+    // 5) (Optional) filter: enable only if you expect glitches
+    // tim->CH0.CTRL.B.FLT_EN = 1;
+
+    // 6) (Optional) capture a timestamp when the edge happens
+    // Put TBU_TS0 into GPR0 so you can log it
+    tim->CH0.CTRL.B.GPR0_SEL = 0x0;   // TS0 (basic setting; depends on EGPR0_SEL in your device)
+    tim->CH0.CTRL.B.EGPR0_SEL = 0;
+
+    // 7) Enable NEWVAL interrupt
     tim->CH0.IRQ.EN.B.NEWVAL_IRQ_EN = 1;
-    tim->CH0.IRQ.NOTIFY.B.NEWVAL    = 1; // Clear any pending flag
+    tim->CH0.IRQ.NOTIFY.B.NEWVAL = 1;  // clear pending
+
+    // 8) Enable last
+    tim->CH0.CTRL.B.TIM_EN = 1;
+}
+
+static void debugCMU0(void)
+{
+    Ifx_GTM_ATOM *atom = &gtm->ATOM[DEBUG_PIN.atom];
+    Ifx_GTM_ATOM_AGC *agc  = &atom->AGC;
+
+
+
+    atom->CH3.CTRL.B.MODE      = 2;   // SOMP
+    atom->CH3.CTRL.B.SL        = 0;
+    atom->CH3.CTRL.B.CLK_SRC_SR= 1;
+    atom->CH3.CTRL.B.UDMODE    = 0;
+    atom->CH3.CTRL.B.OSM = 0;
+
+    atom->CH3.SR1.U = 1;  // duty compare (CCU1)
+    atom->CH3.SR0.U = 2;    // period compare (CCU0)
+
+    agc->OUTEN_CTRL.B.OUTEN_CTRL3 = 2;
+    agc->GLB_CTRL.B.UPEN_CTRL3    = 2;
+    agc->ENDIS_CTRL.B.ENDIS_CTRL3 = 2;
+    //agc->GLB_CTRL.B.HOST_TRIG     = 1;
 }
 
 void init(void)
 {
-    IfxGtm_enable(gtm);
 
+    IfxGtm_enable(gtm);
     float32 mod = IfxGtm_Cmu_getModuleFrequency(gtm);
     IfxGtm_Cmu_setGclkFrequency(gtm, mod);
 
     IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_0, mod);
-    IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_1, FREQUENCY+1000);
+    IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_1, FREQUENCY);
 
-    IfxGtm_Cmu_enableClocks(gtm, IFXGTM_CMU_CLKEN_CLK0 | IFXGTM_CMU_CLKEN_CLK1);
+
 
     initTx();
     initDir();
     initClock();
     initRx();
-
-    // Startup Delay
-    for(int i = 0; i < 1e6; i++) __nop();
+    initRxStartBitDetector();
+    debugCMU0();
 
     // --- START SEQUENCE SYNCHRONIZATION ---
 
@@ -173,22 +225,44 @@ void init(void)
 
     // 2. Trigger the Clock (Master)
     // Host Trigger starts the Clock generation immediately after Dir is primed
+    atom->CH3.CN0.U = 0;
     gtm->ATOM[0].AGC.GLB_CTRL.B.HOST_TRIG = 1;
-    printf("Init done\n");
 
-    while(1)
+    MODULE_GTM.CMU.CLK_EN.U = (2u << 0) | (2u << 2);
+    IfxGtm_PinMap_setAtomTout(&CLOCK_PIN, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
+    IfxGtm_PinMap_setAtomTout(&DEBUG_PIN, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
+    IfxGtm_PinMap_setAtomTout(&DIR_PIN, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
+
+
+
+    /*
+    while (1)
     {
-        if (gtm->TIM[RX_PIN.tim].CH0.IRQ.NOTIFY.B.NEWVAL)
+        // First rising edge detector (TIEM CH0)
+        if (MODULE_GTM.TIM[0].CH0.IRQ.NOTIFY.B.NEWVAL)
         {
-            // GPR1 contains: [ECNT (8 bits) | DATA (24 bits)]
-            uint32 rawValue = gtm->TIM[RX_PIN.tim].CH0.CNT.U;
+            MODULE_GTM.TIM[0].CH0.IRQ.NOTIFY.B.NEWVAL = 1;
 
-            // Mask out the top 8 bits to see just the data
-            uint32 dataOnly = rawValue & 0x00FFFFFF;
+            // (Optional) read timestamp captured into GPR0
+            uint32 ts0 = MODULE_GTM.TIM[0].CH0.GPR0.U;
 
-            gtm->TIM[RX_PIN.tim].CH0.IRQ.NOTIFY.B.NEWVAL = 1;
+            // --- Your "trigger" action for the scope ---
+            // e.g. toggle a port pin or force an ATOM output
+            // IfxPort_togglePin(TRIG_PORT, TRIG_PIN);
 
-            printf("Raw: 0x%08X | Data: 0x%06X\n", rawValue, dataOnly);
+            printf("Startbit rising edge detected, TS0=0x%06X\n", ts0 & 0x00FFFFFF);
+            // Start the serial shifter now
+            MODULE_GTM.TIM[0].CH1.CTRL.B.TIM_EN = 1;
+        }
+
+        // Your existing "data ready" (TSSM CH1)
+        if (MODULE_GTM.TIM[0].CH1.IRQ.NOTIFY.B.NEWVAL)
+        {
+            MODULE_GTM.TIM[0].CH1.IRQ.NOTIFY.B.NEWVAL = 1;
+
+            uint32 raw = MODULE_GTM.TIM[0].CH1.GPR0.U; // (often shift result lives in GPRx in TSSM)
+            printf("RX word: 0x%08X\n", raw);
         }
     }
+    */
 }
