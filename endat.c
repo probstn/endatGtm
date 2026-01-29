@@ -7,6 +7,8 @@
 #include "IfxCpu_Irq.h"
 #include <stdio.h>
 #include "IfxStm.h"
+#include "IfxPort.h"
+#include "IfxPort_PinMap.h"
 
 // ---------------------- HW handles ----------------------
 static Ifx_GTM *gtm = &MODULE_GTM;
@@ -21,8 +23,10 @@ static const IfxGtm_Atom_ToutMap *dir_pin   = &IfxGtm_ATOM0_2_TOUT2_P02_2_OUT;
 static const IfxGtm_Atom_ToutMap *debug_pin = &IfxGtm_ATOM0_3_TOUT3_P02_3_OUT;
 static const IfxGtm_Tim_TinMap   *rx_pin    = &IfxGtm_TIM0_0_P02_0_IN;
 
+#define DBG_PIN     &MODULE_P14,6
+
 // ---------------------- Timing --------------------------
-#define FREQUENCY   1e6
+#define FREQUENCY   1e5
 #define SYS_FREQ    100e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
@@ -62,25 +66,65 @@ IFX_INTERRUPT(timRxISR, 0, ISR_PRIORITY_RX);
 
 static volatile uint8 wait_done = 0;
 
+#define ISR_PRIORITY_RX_START  9
+IFX_INTERRUPT(timRxStartISR, 0, ISR_PRIORITY_RX_START);
+
+void timRxStartISR(void)
+{
+    IfxPort_togglePin(DBG_PIN);
+
+    // Clear CH1 NEWVAL
+    MODULE_GTM.TIM[0].CH1.IRQ.NOTIFY.B.NEWVAL = 1;
+
+    // Reset CH0 shift progress
+    MODULE_GTM.TIM[0].CH0.CNTS.B.CNTS = (RX_BITS - 1);
+    MODULE_GTM.TIM[0].CH0.CNT.U       = 0;            // clear shift register counter field
+
+    // Start sampling clock and shifting
+    MODULE_GTM.CMU.CLK_EN.U |= (1u << 1);             // enable CMU_CLK1
+    MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 1;
+}
+
 void timRxISR(void)
 {
+    IfxPort_togglePin(DBG_PIN);
     MODULE_GTM.TIM[0].CH0.IRQ.NOTIFY.B.NEWVAL = 1;
-    MODULE_GTM.TIM[0].CH0.IRQ.EN.B.NEWVAL_IRQ_EN = 1;
 
-    if(wait_done)
+    // Stop sampling
+    MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 0;
+    MODULE_GTM.CMU.CLK_EN.U &= ~(1u << 1);
+    prepareModeTransmission();
+
+    uint32 rawData = MODULE_GTM.TIM[0].CH0.CNT.U & 0x00FFFFFFu;
+
+    // Print raw bits
+
+/*
+    for (int i = 0; i < 24; i++)
+        printf("%u", (rawData >> i) & 1u);
+    printf("\n");
+
+*/
+    uint8  startBit = (rawData >> 0) & 1u;
+    uint8  faultBit = (rawData >> 1) & 1u;
+    uint32 position = (rawData >> 2)  & 0x7FFFFu;
+
+    if (startBit != 1)
     {
-        // Stop & re-arm everything for next time first (avoids extra edges while printing)
-        prepareModeTransmission();
-
-        // NOTE: You currently shift into TIM0 CH0
-        uint32 rawData = tim->CH0.GPR1.U & 0x00FFFFFFu;
-        uint32 position = (rawData >> 2) & 0x7FFFFu;
-
-        //printf("ISR: Raw=0x%06X  Pos=%u\n", (unsigned)rawData, (unsigned)position);
-        printf("%u\n", (unsigned)position);
-        wait_done = 0;
+        printf("Invalid frame\n");
     }
-    else wait_done = 1;
+    else
+    {
+        if (!faultBit)
+            printf("%lu\n", position);
+
+            //printf("Fault\n");
+    }
+    // Re-arm start detector
+    MODULE_GTM.TIM[0].CH1.CTRL.B.TIM_EN = 0;
+    MODULE_GTM.TIM[0].CH1.IRQ.NOTIFY.B.NEWVAL = 1;
+    MODULE_GTM.TIM[0].CH1.CTRL.B.TIM_EN = 1;
+
 }
 
 // =========================================================
@@ -107,10 +151,10 @@ void init(void)
     initPins();
 
     // Put system into a known idle/prepared state
-    prepareModeTransmission();
-
+    IfxPort_setPinModeOutput(DBG_PIN, IfxPort_OutputMode_pushPull, IfxPort_OutputIdx_general);
     while(1)
     {
+
         fireTransmission();
         IfxStm_wait(IfxStm_getTicksFromMilliseconds(&MODULE_STM0, 100));
     }
@@ -161,7 +205,7 @@ static void initAtomClock(void)
     agc->OUTEN_CTRL.B.OUTEN_CTRL0 = 2;  // enable output
     agc->GLB_CTRL.B.UPEN_CTRL0    = 2;  // enable update
     agc->ENDIS_CTRL.B.ENDIS_CTRL0 = 2;  // enable operation
-    agc->FUPD_CTRL.B.RSTCN0_CH0 = 2;
+    //agc->FUPD_CTRL.B.RSTCN0_CH0 = 2;
 }
 
 static void initAtomTx(void)
@@ -182,13 +226,13 @@ static void initAtomTx(void)
     //ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
     //ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
-
-    ch->SR1.U = 0x7u << (24 - 7); // example pattern
-    ch->SR0.U = 7u;
+    ch->SR1.U = 0x7u << (24 - 8); // example pattern
+    ch->SR0.U = 8u;
 
     agc->OUTEN_CTRL.B.OUTEN_CTRL1 = 2;
     agc->GLB_CTRL.B.UPEN_CTRL1    = 2;
     agc->ENDIS_CTRL.B.ENDIS_CTRL1 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH1 = 2;
 }
 
 static void initAtomDir(void)
@@ -209,6 +253,7 @@ static void initAtomDir(void)
     agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;  // enable output
     agc->GLB_CTRL.B.UPEN_CTRL2    = 2;  // enable update
     agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;  // enable operation
+    //agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
 }
 
 static void initAtomDebug(void)
@@ -225,6 +270,7 @@ static void initAtomDebug(void)
     agc->OUTEN_CTRL.B.OUTEN_CTRL3 = 2;
     agc->GLB_CTRL.B.UPEN_CTRL3    = 2;
     agc->ENDIS_CTRL.B.ENDIS_CTRL3 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH3 = 2;
 }
 
 // =========================================================
@@ -232,46 +278,57 @@ static void initAtomDebug(void)
 // =========================================================
 static void initTimRx(void)
 {
-    // TIM0 CH0 = TSSM (shift 24 bits)
-    Ifx_GTM_TIM_CH *ch = timCh(rx_pin->channel);
+    Ifx_GTM_TIM_CH *ch = timCh(0);
 
     IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_noPullDevice);
 
-    ch->CTRL.B.TIM_EN     = 0;
-    ch->CTRL.B.TIM_MODE   = 0x6;   // TSSM
-    ch->CTRL.B.CLK_SEL    = 1;     // CMU_CLK1
-    ch->CTRL.B.CICTRL     = 0;
-    ch->CTRL.B.EXT_CAP_EN = 1;
-    ch->ECTRL.B.EXT_CAP_SRC = 0x0; // "next channel" trigger in your current approach
+    ch->CTRL.B.TIM_EN   = 0;
+    ch->CTRL.B.TIM_MODE = 0x6;     // TSSM
+    ch->CTRL.B.ISL      = 0;       // sample from FOUTx (RX input)
+    ch->CTRL.B.DSL      = 1;       // shift direction (pick what matches your bit order)
 
+    // IMPORTANT: do NOT use external capture for “start” here
+    ch->CTRL.B.EXT_CAP_EN = 0;
+
+    // Select shift clock source = CMU_CLK1.
+    // On many TC3xx setups, CLK_SEL is used when CNTS[17:16]=00 (default path).
+    ch->CTRL.B.CLK_SEL = 1;        // CMU_CLK1
+
+    // Program “24 bits”
     ch->CNTS.U = 0;
-    ch->CNTS.B.CNTS = RX_CNTS;
+    ch->CNTS.B.CNTS = (RX_BITS - 1);   // CNTS[7:0] = 23
 
-    ch->CTRL.B.GPR1_SEL = 3;
-
+    // NEWVAL at end of frame
     ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1;
     ch->IRQ.NOTIFY.B.NEWVAL    = 1;
 
     IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_RX);
     IfxSrc_enable(&SRC_GTM_TIM0_0);
 
-    ch->CTRL.B.TIM_EN = 1;
+    // Leave disabled for now; we enable it on start edge
+    // ch->CTRL.B.TIM_EN = 1;
 }
 
 static void initTimRxTrigger(void)
 {
-    // TIM0 CH1 = TIEM (first rising edge trigger)
-    Ifx_GTM_TIM_CH *ch = timCh(rx_pin->channel + 1);
+    Ifx_GTM_TIM_CH *ch = timCh(1);
 
     ch->CTRL.B.TIM_EN   = 0;
-    ch->CTRL.B.TIM_MODE = 0x2;  // TIEM
-    ch->CTRL.B.OSM      = 1;    // one-shot
-    ch->CTRL.B.CICTRL   = 1;    // previous input
-    ch->CTRL.B.DSL      = 1;    // rising
+    ch->CTRL.B.TIM_MODE = 0x2;   // TIEM
+    ch->CTRL.B.OSM      = 1;     // one-shot
 
-    // No IRQ needed from trigger channel (optional)
-    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0;
-    ch->IRQ.NOTIFY.B.NEWVAL    = 0;
+    // Use same physical RX input as CH0
+    ch->CTRL.B.CICTRL   = 1;     // previous channel input (CH0)
+
+    // Select which edge is “start”
+    ch->CTRL.B.DSL      = 1;     // (example) falling edge / or rising depending on your line
+    ch->CTRL.B.ISL      = 0;     // keep default unless you specifically need it
+
+    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1;
+    ch->IRQ.NOTIFY.B.NEWVAL    = 1;
+
+    IfxSrc_init(&SRC_GTM_TIM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_RX_START);
+    IfxSrc_enable(&SRC_GTM_TIM0_1);
 
     ch->CTRL.B.TIM_EN = 1;
 }
@@ -300,9 +357,6 @@ void prepareModeTransmission(void)
     agc->OUTEN_STAT.U = 0x55; //disable first 4
 
     MODULE_GTM.CMU.CLK_EN.U = 0x5; //disable cmu0 & cmu1
-
-    // (optional) re-arm/re-init internal state while idle
-    // initAtomClock();  // only if you want registers preloaded already
 }
 
 
@@ -313,12 +367,14 @@ void prepareModeTransmission(void)
 void fireTransmission(void)
 {
 
-    atom->CH0.CN0.U = 0;
-    atom->CH1.CN0.U = 0;
-    atom->CH2.CN0.U = PERIOD*8;
-    agc->GLB_CTRL.B.HOST_TRIG = 1;
+        atom->CH0.CN0.U = PERIOD;
+        atom->CH1.CN0.U = 0;
+        atom->CH2.CN0.U = PERIOD*8;
+        atom->CH3.CN0.U = 2*PERIOD;
 
-    agc->OUTEN_STAT.U = 0xAA; //enable first 4
-    MODULE_GTM.CMU.CLK_EN.U = 0xA; //enable cmu0 & cmu1
+        // ideally: force update for all channels here
 
+        agc->OUTEN_CTRL.U = 0xAA;          // outputs on (or do this via OUTEN_CTRL with UPEN)
+        agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
+        MODULE_GTM.CMU.CLK_EN.U = 0xA;     // enable clocks FIRST
 }
