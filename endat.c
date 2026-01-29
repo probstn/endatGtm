@@ -15,15 +15,15 @@ static Ifx_GTM_ATOM_AGC *agc  = NULL_PTR;
 static Ifx_GTM_TIM      *tim  = NULL_PTR;
 
 // ---------------------- Pin maps ------------------------
-static const IfxGtm_Atom_ToutMap *clock_pin = &IfxGtm_ATOM0_0_TOUT8_P02_8_OUT;
-static const IfxGtm_Atom_ToutMap *tx_pin    = &IfxGtm_ATOM0_1_TOUT1_P02_1_OUT;
+static const IfxGtm_Atom_ToutMap *clock_pin = &IfxGtm_ATOM0_0_TOUT53_P21_2_OUT;
+static const IfxGtm_Atom_ToutMap *tx_pin    = &IfxGtm_ATOM0_1_TOUT47_P22_0_OUT;
 static const IfxGtm_Atom_ToutMap *dir_pin   = &IfxGtm_ATOM0_2_TOUT2_P02_2_OUT;
 static const IfxGtm_Atom_ToutMap *debug_pin = &IfxGtm_ATOM0_3_TOUT3_P02_3_OUT;
 static const IfxGtm_Tim_TinMap   *rx_pin    = &IfxGtm_TIM0_0_P02_0_IN;
 
 // ---------------------- Timing --------------------------
-#define FREQUENCY   100e3f
-#define SYS_FREQ    100000000.0f
+#define FREQUENCY   1e6
+#define SYS_FREQ    100e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
 #define RX_BITS     24u
@@ -76,7 +76,8 @@ void timRxISR(void)
         uint32 rawData = tim->CH0.GPR1.U & 0x00FFFFFFu;
         uint32 position = (rawData >> 2) & 0x7FFFFu;
 
-        printf("ISR: Raw=0x%06X  Pos=%u\n", (unsigned)rawData, (unsigned)position);
+        //printf("ISR: Raw=0x%06X  Pos=%u\n", (unsigned)rawData, (unsigned)position);
+        printf("%u\n", (unsigned)position);
         wait_done = 0;
     }
     else wait_done = 1;
@@ -111,7 +112,7 @@ void init(void)
     while(1)
     {
         fireTransmission();
-        IfxStm_wait(IfxStm_getTicksFromMicroseconds(&MODULE_STM0, 1000));
+        IfxStm_wait(IfxStm_getTicksFromMilliseconds(&MODULE_STM0, 100));
     }
 }
 
@@ -160,7 +161,7 @@ static void initAtomClock(void)
     agc->OUTEN_CTRL.B.OUTEN_CTRL0 = 2;  // enable output
     agc->GLB_CTRL.B.UPEN_CTRL0    = 2;  // enable update
     agc->ENDIS_CTRL.B.ENDIS_CTRL0 = 2;  // enable operation
-    agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH0 = 2;
 }
 
 static void initAtomTx(void)
@@ -192,18 +193,22 @@ static void initAtomTx(void)
 
 static void initAtomDir(void)
 {
-    Ifx_GTM_ATOM_CH *ch = &atom->CH2;
+    Ifx_GTM_ATOM_CH *ch = atomCh(dir_pin->channel);
 
     ch->CTRL.B.MODE       = 2;   // SOMP
-    ch->CTRL.B.OSM        = 1;   // One-shot
     ch->CTRL.B.SL         = 1;
     ch->CTRL.B.CLK_SRC_SR = 0;
+    ch->CTRL.B.UDMODE     = 0;
+    ch->CTRL.B.OSM        = 1;
 
-    ch->CM1.U = PERIOD * 7;   // go low
-    ch->CM0.U = PERIOD * 9;  // go high
+    ch->SR1.U = PERIOD * 7;
+    ch->SR0.U = PERIOD * 9;
 
-    agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;
-    agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;
+    ch->CTRL.B.TRIGOUT = 1;
+
+    agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;  // enable output
+    agc->GLB_CTRL.B.UPEN_CTRL2    = 2;  // enable update
+    agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;  // enable operation
 }
 
 static void initAtomDebug(void)
@@ -276,10 +281,10 @@ static void initTimRxTrigger(void)
 // =========================================================
 static void initPins(void)
 {
-    IfxGtm_PinMap_setAtomTout(clock_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
-    IfxGtm_PinMap_setAtomTout(debug_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
-    IfxGtm_PinMap_setAtomTout(dir_pin,   IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
-    IfxGtm_PinMap_setAtomTout(tx_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed4);
+    IfxGtm_PinMap_setAtomTout(clock_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(debug_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(dir_pin,   IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(tx_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
 }
 
 // =========================================================
@@ -310,7 +315,7 @@ void fireTransmission(void)
 
     atom->CH0.CN0.U = 0;
     atom->CH1.CN0.U = 0;
-    atom->CH2.CN0.U = PERIOD * 8;
+    atom->CH2.CN0.U = PERIOD*8;
     agc->GLB_CTRL.B.HOST_TRIG = 1;
 
     agc->OUTEN_STAT.U = 0xAA; //enable first 4
