@@ -86,7 +86,7 @@ void timRxWordDoneISR(void)
 {
     if(captured_words > 1) return;
     IfxPort_togglePin(DBG_DMA_PIN);
-    rx_buffer[captured_words++] = (tim->CH0.GPR1.U & 0x00FFFFFFu);
+    rx_buffer[captured_words++] = (tim->CH0.GPR1.U);
     IfxPort_togglePin(DBG_DMA_PIN);
 }
 
@@ -208,13 +208,29 @@ void init(void)
 
     while(true)
     {
+        uint32 w0 = (rx_buffer[0] >> 11) & 0x1FFFu;   // 13 bits
+        uint32 w1 = (rx_buffer[1] >> 11) & 0x1FFFu;   // 13 bits
+
+        bool startbit = (w0 >> 0) & 1u;
+        bool faultbit = (w0 >> 1) & 1u;
+
+        uint32 pos_lo11 = (w0 >> 2) & 0x7FFu;     // bits 0..10
+        uint32 pos_hi8  = (w1 >> 0) & 0xFFu;      // bits 11..18
+        uint32 position = pos_lo11 | (pos_hi8 << 11);
+
+        uint8 crc = (w1 >> 8) & 0x1Fu;            // 5-bit CRC
+
+
         if(captured_words > 1)
         {
-            printf("0x%08" PRIx32 " 0x%08" PRIx32 "\n", rx_buffer[0], rx_buffer[1]);
+            //printf("%X %X\n", w0, w1);
+            printf("%d %d %d %d\n", startbit, faultbit, position, crc);
             break;
         }
     }
 }
+
+
 
 static void initDmaRx(void)
 {
@@ -227,7 +243,7 @@ static void initDmaRx(void)
 
     chCfg.channelId = DMA_CH_RX;
 
-    chCfg.sourceAddress = (uint32)&MODULE_GTM.TIM[0].CH0.GPR0.U;
+    chCfg.sourceAddress = (uint32)&MODULE_GTM.TIM[0].CH0.GPR1.U;
     //chCfg.sourceAddressIncrementStep      = IfxDma_ChannelIncrementStep_1;
     //chCfg.sourceAddressIncrementDirection = IfxDma_ChannelIncrementDirection_positive;
     chCfg.sourceCircularBufferEnabled     = TRUE;
