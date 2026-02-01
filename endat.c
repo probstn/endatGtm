@@ -394,12 +394,12 @@ static void initTimRx(void)
     // shift length
     ch->CNTS.U = 0;
     ch->CNTS.B.CNTS = (RX_WORD_LENGTH_BITS - 1);  // number of shift clocks per word
-    ch->CNTS.U |= (1<<21);
+    ch->CNTS.U |= (1<<22);
     ch->GPR0.U = 0;
 
     //clock source
     ch->CTRL.B.CLK_SEL = 1;  // CMU_CLK1
-    ch->CNTS.B.CNTS &= ~(0x3<<15); //CNTS[17:16] = 00b
+    ch->CNTS.B.CNTS &= ~(0x3<<16); //CNTS[17:16] = 00b
 
     //interrupt
     ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1;
