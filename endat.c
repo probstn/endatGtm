@@ -9,14 +9,16 @@
 #include "IfxStm.h"
 #include "IfxDma_Dma.h"
 #include "IfxDma.h"
+#include <stdbool.h>
+#include <inttypes.h>
+
 
 // ---------------------- CONFIGURATION & DEFINES (Moved to Top) ----------------------
 #define FREQUENCY   1e5
 #define SYS_FREQ    100e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
-#define RX_SEG_BITS     13u
-#define RX_SEG_CNTS     (RX_SEG_BITS - 1u)   // 12
+#define RX_WORD_LENGTH_BITS     13u
 #define RX_SEGS         2u
 
 // Interrupt Priorities
@@ -45,8 +47,6 @@ static const IfxGtm_Tim_TinMap   *rx_pin    = &IfxGtm_TIM0_0_P02_0_IN;
 // ---------------------- Global Vars ----------------------
 static IfxDma_Dma dma;
 static IfxDma_Dma_Channel dmaCh;
-
-static volatile uint32 rxSeg[RX_SEGS];
 
 // ---------------------- Helpers --------------------------
 static inline Ifx_GTM_ATOM_CH *atomCh(uint8 ch) {
@@ -78,9 +78,15 @@ void fireTransmission(void);
 // =========================================================
 #define ISR_PRIORITY_TIM0_CH0_NEWVAL  11
 
+static volatile uint32 rx_buffer[RX_SEGS] = {0};
+volatile int captured_words = 0;
+
 IFX_INTERRUPT(timRxWordDoneISR, 0, ISR_PRIORITY_TIM0_CH0_NEWVAL);
 void timRxWordDoneISR(void)
 {
+    if(captured_words > 1) return;
+    IfxPort_togglePin(DBG_DMA_PIN);
+    rx_buffer[captured_words++] = (tim->CH0.GPR1.U & 0x00FFFFFFu);
     IfxPort_togglePin(DBG_DMA_PIN);
 }
 
@@ -90,15 +96,13 @@ IFX_INTERRUPT(dmaRxISR, 0, ISR_PRIORITY_DMA_RX);
 void dmaRxISR(void)
 {
     IfxPort_togglePin(DBG_DMA_PIN);
-    /*
-    //IfxPort_togglePin(DBG_DMA_PIN);
+
+
     printf("rxSeg0 raw = 0x%08lx, rxSeg1 raw = 0x%08lx\n",
-           (unsigned long)rxSeg[0],
-           (unsigned long)rxSeg[1]);
+           (unsigned long)rx_buffer[0],
+           (unsigned long)rx_buffer[1]);
 
-
-    uint32 gpr0 = MODULE_GTM.TIM[0].CH0.GPR0.U;
-    printf("TIM GPR0 = 0x%08lx\n", (unsigned long)gpr0);
+    /*
 
     // 1. Immediately stop the Shift Timer (TIM0_CH0) and Clock
     MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 0;
@@ -151,8 +155,6 @@ void prepareModeTransmission(void)
     MODULE_GTM.CMU.CLK_EN.U = 0x5;
 }
 
-
-
 /**
  * Start a single transmission frame.
  * Enables clocks + enables ATOM channels + sets initial counters, then HOST_TRIG.
@@ -203,6 +205,15 @@ void init(void)
     prepareModeTransmission();
 
     fireTransmission();
+
+    while(true)
+    {
+        if(captured_words > 1)
+        {
+            printf("0x%08" PRIx32 " 0x%08" PRIx32 "\n", rx_buffer[0], rx_buffer[1]);
+            break;
+        }
+    }
 }
 
 static void initDmaRx(void)
@@ -217,17 +228,16 @@ static void initDmaRx(void)
     chCfg.channelId = DMA_CH_RX;
 
     chCfg.sourceAddress = (uint32)&MODULE_GTM.TIM[0].CH0.GPR0.U;
-    chCfg.sourceAddressIncrementStep      = IfxDma_ChannelIncrementStep_1;
-    chCfg.sourceAddressIncrementDirection = IfxDma_ChannelIncrementDirection_positive;
+    //chCfg.sourceAddressIncrementStep      = IfxDma_ChannelIncrementStep_1;
+    //chCfg.sourceAddressIncrementDirection = IfxDma_ChannelIncrementDirection_positive;
     chCfg.sourceCircularBufferEnabled     = TRUE;
-    chCfg.sourceAddressCircularRange      = IfxDma_ChannelIncrementCircular_4;  // keep source fixed (32-bit)
+    chCfg.sourceAddressCircularRange      = IfxDma_ChannelIncrementCircular_none;  // keep source fixed (32-bit)
 
 
     // DESTINATION: Buffer in RAM
-    chCfg.destinationAddress = IFXCPU_GLB_ADDR_DSPR(IfxCpu_getCoreId(), &rxSeg[0]);
+    chCfg.destinationAddress = IFXCPU_GLB_ADDR_DSPR(IfxCpu_getCoreId(), &rx_buffer[0]);
     chCfg.destinationAddressIncrementStep      = IfxDma_ChannelIncrementStep_1;
     chCfg.destinationAddressIncrementDirection = IfxDma_ChannelIncrementDirection_positive;
-    chCfg.destinationCircularBufferEnabled     = FALSE;
 
     // TRANSFER CONFIG
     chCfg.blockMode     = IfxDma_ChannelMove_1;
@@ -362,28 +372,44 @@ static void initAtomDebug(void)
     agc->FUPD_CTRL.B.RSTCN0_CH3 = 2;
 }
 
-static void initTimRx(void) {
+static void initTimRx(void)
+{
     Ifx_GTM_TIM_CH *ch = timCh(0);
     IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_noPullDevice);
+    ch->CTRL.B.TIM_EN = 0; //disable
 
-    ch->CTRL.B.TIM_EN = 0;
-    ch->CTRL.B.TIM_MODE = 0x6; // TSM Mode
+    /* --- Mode: TSSM --- */
+    ch->CTRL.B.TIM_MODE   = 0x6;     // 0b110 = TSSM
+    ch->CTRL.B.EXT_CAP_EN = 0;       // shifting driven by shift clock
+    ch->CTRL.B.ISL        = 0;       // shift in from F_OUTx (real input)
 
-    // Crucial: Load GPR1 with the number of bits to shift
-    // This reloads CNTS automatically for the second segment
-    ch->GPR1.B.GPR1 = RX_SEG_CNTS;
-    ch->CNTS.B.CNTS = RX_SEG_CNTS;
+    ch->CTRL.B.DSL = 1; //DSL=0 (shift-left, new bit into CNT[0])   DSL=1 (shift-right, new bit into CNT[23])
 
-    ch->CTRL.B.ISL = 0;
-    ch->CTRL.B.DSL = 1;
-    ch->CTRL.B.CLK_SEL = 1; // CMU_CLK1
+    ch->CTRL.B.FLT_EN = 0; //optional filter input (input is clean so not used)
 
+    ch->CTRL.B.EGPR1_SEL = 0;     //Capture: latch the shifted word into GPR1 on NEWVAL
+    ch->CTRL.B.GPR1_SEL  = 0x3;   // 0b11 = CNT -> GPR1 in this encoding
+    // If you also want something else in GPR0 (timestamp/ECNT/etc) set GPR0_SEL accordingly
+
+    // shift length
+    ch->CNTS.U = 0;
+    ch->CNTS.B.CNTS = (RX_WORD_LENGTH_BITS - 1);  // number of shift clocks per word
+    ch->CNTS.U |= (1<<21);
+    ch->GPR0.U = 0;
+
+    //clock source
+    ch->CTRL.B.CLK_SEL = 1;  // CMU_CLK1
+    ch->CNTS.B.CNTS &= ~(0x3<<15); //CNTS[17:16] = 00b
+
+    //interrupt
     ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1;
-    ch->IRQ.MODE.B.IRQ_MODE = 0x2; // Pulse mode is often better for DMA triggers
+    ch->IRQ.MODE.B.IRQ_MODE    = 0x2;
 
-    //IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_NEWVAL);
-    IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_dma, DMA_CH_RX);
+    //IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_dma, DMA_CH_RX);
+    IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_NEWVAL);
     IfxSrc_enable(&SRC_GTM_TIM0_0);
+
+    ch->CTRL.B.TIM_EN = 1;
 }
 
 static void initTimRxTrigger(void) {
