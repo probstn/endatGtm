@@ -14,8 +14,8 @@
 
 
 // ---------------------- CONFIGURATION & DEFINES (Moved to Top) ----------------------
-#define FREQUENCY   1e5
-#define SYS_FREQ    100e6
+#define FREQUENCY   1e6
+#define SYS_FREQ    96e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
 #define RX_WORD_LENGTH_BITS     13u
@@ -63,11 +63,11 @@ static void initGtmCmu(void);
 static void initAtomClock(void);
 static void initAtomTx(void);
 static void initAtomDir(void);
-static void initAtomDebug(void);
-static void initTimRx(void);
-static void initTimRxTrigger(void);
+static void initTimRx_Tdu_2x13(void);
+static void initTimRx_Tssm(void);
 static void initPins(void);
 static void initDmaRx(void);
+unsigned int MakeCrcPos(unsigned int clocks, unsigned int error1, unsigned int error2, unsigned int endat22, unsigned long highpos, unsigned long lowpos);
 
 // Requested API
 void prepareModeTransmission(void);
@@ -78,15 +78,16 @@ void fireTransmission(void);
 // =========================================================
 #define ISR_PRIORITY_TIM0_CH0_NEWVAL  11
 
-static volatile uint32 rx_buffer[RX_SEGS] = {0};
+static volatile uint32 pos_frame = 0;
 volatile int captured_words = 0;
 
 IFX_INTERRUPT(timRxWordDoneISR, 0, ISR_PRIORITY_TIM0_CH0_NEWVAL);
 void timRxWordDoneISR(void)
 {
-    if(captured_words > 1) return;
+    //if(captured_words > 1) return;
     IfxPort_togglePin(DBG_DMA_PIN);
-    rx_buffer[captured_words++] = (tim->CH0.GPR1.U);
+    //uint16_t word = (tim->CH0.GPR1.U >> 11) & 0x1FFF;
+    //pos_frame |= (captured_words++ == 0) ? (word) : (word << 13);
     IfxPort_togglePin(DBG_DMA_PIN);
 }
 
@@ -96,11 +97,6 @@ IFX_INTERRUPT(dmaRxISR, 0, ISR_PRIORITY_DMA_RX);
 void dmaRxISR(void)
 {
     IfxPort_togglePin(DBG_DMA_PIN);
-
-
-    printf("rxSeg0 raw = 0x%08lx, rxSeg1 raw = 0x%08lx\n",
-           (unsigned long)rx_buffer[0],
-           (unsigned long)rx_buffer[1]);
 
     /*
 
@@ -123,11 +119,11 @@ void timRxStartISR(void)
 {
     IfxPort_togglePin(DBG_START_PIN);
 
-    IfxSrc_clearRequest(&SRC_GTM_TIM0_1);
+    //IfxSrc_clearRequest(&SRC_GTM_TIM0_1);
 
     /* Now start bit clock + shifter */
-    MODULE_GTM.CMU.CLK_EN.U |= (1u << 1);
-    MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 1;
+    //MODULE_GTM.CMU.CLK_EN.U |= (1u << 1);
+    //MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 1;
 }
 
 
@@ -162,18 +158,24 @@ void prepareModeTransmission(void)
 void fireTransmission(void)
 {
 
-    atom->CH0.CN0.U = PERIOD;
+    atom->CH0.CN0.U = 0;
     atom->CH1.CN0.U = 0;
-    atom->CH2.CN0.U = PERIOD*8;
-    atom->CH3.CN0.U = 2*PERIOD;
-
-    // ideally: force update for all channels here
-
-    agc->OUTEN_CTRL.U = 0xAA;          // outputs on (or do this via OUTEN_CTRL with UPEN)
+    atom->CH2.CN0.U = 0;
     agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
-    MODULE_GTM.CMU.CLK_EN.U = 0xA;     // enable clocks FIRST
+    //agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
 }
 
+uint8_t reverse5(uint8_t b) {
+    b = ((b & 0xF) << 4) | ((b & 0xF0) >> 4); // Swap nibbles (only low 4 relevant first)
+    // Actually simpler for 5 bits:
+    uint8_t r = 0;
+    if (b & 0x01) r |= 0x10; // Bit 0 -> Bit 4
+    if (b & 0x02) r |= 0x08; // Bit 1 -> Bit 3
+    if (b & 0x04) r |= 0x04; // Bit 2 -> Bit 2
+    if (b & 0x08) r |= 0x02; // Bit 3 -> Bit 1
+    if (b & 0x10) r |= 0x01; // Bit 4 -> Bit 0
+    return r;
+}
 // =========================================================
 // Initialization
 // =========================================================
@@ -189,48 +191,87 @@ void init(void)
     initAtomTx();
     initAtomDir();
     initAtomClock();
-    initAtomDebug();
 
-    initTimRx();
+    initTimRx_Tssm();
+    initTimRx_Tdu_2x13();
     initDmaRx();
-    initTimRxTrigger();
 
     initPins();
     IfxPort_setPinModeOutput(DBG_DMA_PIN, IfxPort_OutputMode_pushPull, IfxPort_OutputIdx_general);
     IfxPort_setPinModeOutput(DBG_START_PIN, IfxPort_OutputMode_pushPull, IfxPort_OutputIdx_general);
 
-    agc->GLB_CTRL.B.HOST_TRIG = 1; //update all shadows
+    //agc->GLB_CTRL.B.HOST_TRIG = 1; //update all shadows
 
     // Pre-arm the DMA for the very first run
-    prepareModeTransmission();
+    //prepareModeTransmission();
 
     fireTransmission();
 
     while(true)
     {
-        uint32 w0 = (rx_buffer[0] >> 11) & 0x1FFFu;   // 13 bits
-        uint32 w1 = (rx_buffer[1] >> 11) & 0x1FFFu;   // 13 bits
-
-        bool startbit = (w0 >> 0) & 1u;
-        bool faultbit = (w0 >> 1) & 1u;
-
-        uint32 pos_lo11 = (w0 >> 2) & 0x7FFu;     // bits 0..10
-        uint32 pos_hi8  = (w1 >> 0) & 0xFFu;      // bits 11..18
-        uint32 position = pos_lo11 | (pos_hi8 << 11);
-
-        uint8 crc = (w1 >> 8) & 0x1Fu;            // 5-bit CRC
-
 
         if(captured_words > 1)
         {
-            //printf("%X %X\n", w0, w1);
-            printf("%d %d %d %d\n", startbit, faultbit, position, crc);
+            printf("%X\n", pos_frame & 0x3FFFFFF);
+            bool startbit = pos_frame & 1u;
+            bool faultbit = (pos_frame >> 1) & 1u;
+
+            uint32 position = (pos_frame >> 2) & 0x7FFFF;
+            //printf("%X\n", position);
+
+            uint8 crc = (pos_frame >> 21) & 0x1F; // 5-bit CRC
+            //uint8_t crc_calc = MakeCrcPos(19, faultbit, 0, 0, 0, position);
+            //printf("%.5X\n", crc);
+            //printf("%d %d %d %d\n", startbit, faultbit, position, crc);
             break;
         }
     }
 }
 
+unsigned int MakeCrcPos(unsigned int clocks, unsigned int error1, unsigned int error2, unsigned int endat22, unsigned long highpos, unsigned long lowpos)
+{
+    unsigned int ff[5]; // Zustand der 5 Flip-Flops
+    unsigned int code[66]; // Datenbit-Array
+    unsigned int ex; // Hilfsvariable
+    unsigned int crc = 0; // ermittelter CRC-Code
+    signed int i; // Laufvariable fC<r Schleifen
 
+    for(i = 0; i < 5; i++) // alle Flip-Flops auf 1 setzen
+        ff[i] = 1;
+    if (endat22) // alarm-Bits ins code-Array einlesen
+    {
+        code[0] = error1;
+        code[1] = error2;
+    }
+    else
+        code[1] = error1;
+    for(i = 2; i < 34; i++) // lowpos-Bits ins code-Array einlesen
+    {
+        code[i] = (lowpos & 0x00000001L) ? 1 : 0;
+        lowpos >>= 1;
+    }
+    for(i = 34; i < 66; i++) // highpos-Bits ins code-Array einlesen
+    {
+        code[i] = (highpos & 0x00000001L) ? 1 : 0;
+        highpos >>= 1;
+    }
+    for(i = (endat22 ? 0 : 1); i <= (clocks+1); i++)
+    {   // CRC berechnen, analog zur
+        ex = ff[4] ^ code[i]; // beschriebenen Generator-Hardware
+        ff[4] = ff[3];
+        ff[3] = ff[2] ^ ex;
+        ff[2] = ff[1];
+        ff[1] = ff[0] ^ ex;
+        ff[0] = ex;
+    }
+    for(i = 4; i >= 0; i--) // CRC in Variable ablegen
+    {
+        ff[i] = ff[i] ? 0 : 1; // Bits invertieren
+        crc <<= 1;
+        crc |= ff[i];
+    }
+    return crc;
+}
 
 static void initDmaRx(void)
 {
@@ -251,7 +292,7 @@ static void initDmaRx(void)
 
 
     // DESTINATION: Buffer in RAM
-    chCfg.destinationAddress = IFXCPU_GLB_ADDR_DSPR(IfxCpu_getCoreId(), &rx_buffer[0]);
+    //chCfg.destinationAddress = IFXCPU_GLB_ADDR_DSPR(IfxCpu_getCoreId(), &rx_buffer[0]);
     chCfg.destinationAddressIncrementStep      = IfxDma_ChannelIncrementStep_1;
     chCfg.destinationAddressIncrementDirection = IfxDma_ChannelIncrementDirection_positive;
 
@@ -288,13 +329,9 @@ static void initGtmBase(void)
 
 static void initGtmCmu(void)
 {
-    float32 mod = IfxGtm_Cmu_getModuleFrequency(gtm);
-
     // CMU_CLK0 = fast (for debug, etc.)
-    IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_0, mod);
-
-    // CMU_CLK1 = bit clock (100 kHz)
-    IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_1, FREQUENCY);
+    IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_0, SYS_FREQ);
+    MODULE_GTM.CMU.CLK_EN.U = 0xA;     // enable clocks FIRST
 
     // Do not enable clocks here; fireTransmission() will enable them
 }
@@ -308,9 +345,7 @@ static void initAtomClock(void)
 
     ch->CTRL.B.MODE       = 2;   // SOMP
     ch->CTRL.B.SL         = 0;
-    ch->CTRL.B.CLK_SRC_SR = 0;
-    ch->CTRL.B.UDMODE     = 0;
-    ch->CTRL.B.OSM        = 0;
+    ch->CTRL.B.CLK_SRC_SR = 0; //CMU0
 
     ch->SR1.U = PERIOD / 2;
     ch->SR0.U = PERIOD;
@@ -338,8 +373,8 @@ static void initAtomTx(void)
     ch->CTRL.B.CLK_SRC_SR = 5;
 
     //forward trigger
-    //ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
-    //ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
+    ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
+    ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
     ch->SR1.U = 0x7u << (24 - 8); // example pattern
     ch->SR0.U = 7u;
@@ -354,87 +389,127 @@ static void initAtomDir(void)
 {
     Ifx_GTM_ATOM_CH *ch = atomCh(dir_pin->channel);
 
-    ch->CTRL.B.MODE       = 2;   // SOMP
-    ch->CTRL.B.SL         = 1;
-    ch->CTRL.B.CLK_SRC_SR = 0;
-    ch->CTRL.B.UDMODE     = 0;
-    ch->CTRL.B.OSM        = 1;
+    ch->CTRL.B.MODE   = 3;
+    ch->CTRL.B.ARU_EN = 0;
+    ch->CTRL.B.ACB    = 1;
+    ch->CTRL.B.OSM    = 1;
+    ch->CTRL.B.SL     = 1;
 
-    ch->SR1.U = PERIOD * 7;
-    ch->SR0.U = PERIOD * 9;
+    // Triggered clock from CH0 trigger
+    ch->CTRL.B.ECLK_SRC   = 1;
+    ch->CTRL.B.CLK_SRC_SR = 5;
 
-    ch->CTRL.B.TRIGOUT = 1;
+    //forward trigger
+    //ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
+    //ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
-    agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;  // enable output
-    agc->GLB_CTRL.B.UPEN_CTRL2    = 2;  // enable update
-    agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;  // enable operation
-    //agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
+    ch->SR1.U = 0x7Fu << (24 - 8); // example pattern
+    ch->SR0.U = 8u;
+
+    agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;
+    agc->GLB_CTRL.B.UPEN_CTRL2    = 2;
+    agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
 }
 
-static void initAtomDebug(void)
-{
-    Ifx_GTM_ATOM_CH *ch = atomCh(cmu_pin->channel);
+// You must choose these based on your protocol timing:
+#define BIT_TICKS     16u   // example: sample every 16 ticks of CMU_TDU_CLK
+#define PHASE_TICKS   8u    // example: first sample 8 ticks after start edge
 
-    ch->CTRL.B.MODE       = 2;
-    ch->CTRL.B.SL         = 0;
-    ch->CTRL.B.CLK_SRC_SR = 1;
-
-    ch->SR1.U = 1;
-    ch->SR0.U = 2;
-
-    agc->OUTEN_CTRL.B.OUTEN_CTRL3 = 2;
-    agc->GLB_CTRL.B.UPEN_CTRL3    = 2;
-    agc->ENDIS_CTRL.B.ENDIS_CTRL3 = 2;
-    agc->FUPD_CTRL.B.RSTCN0_CH3 = 2;
-}
-
-static void initTimRx(void)
+static void initTimRx_Tdu_2x13(void)
 {
     Ifx_GTM_TIM_CH *ch = timCh(0);
-    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_noPullDevice);
-    ch->CTRL.B.TIM_EN = 0; //disable
 
-    /* --- Mode: TSSM --- */
-    ch->CTRL.B.TIM_MODE   = 0x6;     // 0b110 = TSSM
-    ch->CTRL.B.EXT_CAP_EN = 0;       // shifting driven by shift clock
-    ch->CTRL.B.ISL        = 0;       // shift in from F_OUTx (real input)
+    // Disable channel while programming TDU/ECTRL
+    ch->CTRL.B.TIM_EN = 0;
 
-    ch->CTRL.B.DSL = 1; //DSL=0 (shift-left, new bit into CNT[0])   DSL=1 (shift-right, new bit into CNT[23])
+    // ------------- Select which edges drive the TDU "active edge" -------------
+    // CTRL.TOCTRL: 01 = enabled for rising edge only (your pasted field)
+    ch->CTRL.B.TOCTRL = 0x1;   // startbit is rising edge
 
-    ch->CTRL.B.FLT_EN = 0; //optional filter input (input is clean so not used)
+    // ------------- TDU clock + slicing -------------
+    // TDUV.TCS: 001 = CMU_CLK1 (your pasted table)
+    ch->TDUV.B.TCS = 0x1;
 
-    ch->CTRL.B.EGPR1_SEL = 0;     //Capture: latch the shifted word into GPR1 on NEWVAL
-    ch->CTRL.B.GPR1_SEL  = 0x3;   // 0b11 = CNT -> GPR1 in this encoding
-    // If you also want something else in GPR0 (timestamp/ECNT/etc) set GPR0_SEL accordingly
+    // TDUV.SLICING: 10 = 3x8-bit counters (your pasted table)
+    ch->TDUV.B.SLICING = 0x2;
 
-    // shift length
-    ch->CNTS.U = 0;
-    ch->CNTS.B.CNTS = (RX_WORD_LENGTH_BITS - 1);  // number of shift clocks per word
-    ch->CNTS.U |= (1<<22);
-    ch->GPR0.U = 0;
+    // Use tdu_sample_evt as Timeout Clock for TO_CNT (TO_CNT2 still uses CMU_CLK(TCS))
+    // This creates: TO_CNT2 (CMU) -> tdu_sample_evt; TO_CNT counts those sample events.
+    ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1;
 
-    //clock source
-    ch->CTRL.B.CLK_SEL = 1;  // CMU_CLK1
-    ch->CNTS.B.CNTS &= ~(0x3<<16); //CNTS[17:16] = 00b
+    // Ensure TO_CNT1 is clocked on tdu_word_evt (default behavior when TDU_SAME_CNT_CLK=0)
+    ch->TDUV.B.TDU_SAME_CNT_CLK = 0;
 
-    //interrupt
-    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1;
-    ch->IRQ.MODE.B.IRQ_MODE    = 0x2;
+    // ------------- Program compare values -------------
+    // With SLICING=10 and TCS_USE_SAMPLE_EVT=1:
+    // - TO_CNT2 clocked by CMU_CLK1: its compare defines sample cadence
+    // - TO_CNT clocked by tdu_sample_evt: its compare defines word cadence
+    // - TO_CNT1 clocked by tdu_word_evt: its compare defines frame cadence
 
-    //IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_dma, DMA_CH_RX);
-    IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_NEWVAL);
-    IfxSrc_enable(&SRC_GTM_TIM0_0);
+    // Make tdu_sample_evt happen EVERY 1 CMU_CLK1 tick => 16 MHz sample pulses
+    // (compare at 0 means "every tick" in typical compare-to-zero style; if your silicon behaves as N+1,
+    // set to 0 for 1-tick period, set to (period-1) for N-tick period.)
+    ch->TDUV.B.TOV2 = 0;                    // sample period = 1 tick of CMU_CLK1 (16 MHz)
 
+    // Make tdu_word_evt after 13 samples
+    ch->TDUV.B.TOV  = (RX_WORD_LENGTH_BITS - 1);   // 12 => 13 sample events
+
+    // Make tdu_frame_evt after 2 words
+    ch->TDUV.B.TOV1 = (RX_SEGS - 1);        // 1 => 2 word events
+
+    // ------------- Start/Stop/Resync policy -------------
+    // Start once on first active edge selected by TOCTRL (rising) (your pasted encoding)
+    ch->ECTRL.B.TDU_START = 0x3;
+
+    // Stop on tdu_frame_evt (after 2 words) (your pasted encoding)
+    ch->ECTRL.B.TDU_STOP  = 0x2;
+
+    // Resync: simplest deterministic choice for slicing!=11 is 0000:
+    // resets counters on each active edge selected by TOCTRL etc. (your Table 46)
+    // This ensures the chain always starts aligned to the detected start edge.
+    ch->ECTRL.B.TDU_RESYNC = 0x0;
+
+    // Optional: Make TODET_IRQ represent "frame done" (tdu_frame_evt)
+    // This gives you a single “frame done” notification source (IRQ/DMA) without touching NEWVAL.
+    ch->ECTRL.B.TODET_IRQ_SRC = 0x2; // 10 = tdu_frame_evt (from your pasted table)
+
+    // Re-enable channel
     ch->CTRL.B.TIM_EN = 1;
 }
 
-static void initTimRxTrigger(void) {
-    Ifx_GTM_TIM_CH *ch = timCh(1);
-    ch->CTRL.B.TIM_EN = 0; ch->CTRL.B.TIM_MODE = 0x2; ch->CTRL.B.OSM = 1;
-    ch->CTRL.B.CICTRL = 1; ch->CTRL.B.DSL = 1;
-    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1; ch->IRQ.NOTIFY.B.NEWVAL = 1;
-    IfxSrc_init(&SRC_GTM_TIM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_RX_START);
-    IfxSrc_enable(&SRC_GTM_TIM0_1);
+static void initTimRx_Tssm(void)
+{
+    Ifx_GTM_TIM_CH *ch = timCh(0);
+
+    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_noPullDevice);
+
+    ch->CTRL.B.TIM_EN = 0;
+
+    // --- TSSM setup ---
+    ch->CTRL.B.TIM_MODE   = 0x6;   // TSSM
+    ch->CTRL.B.DSL        = 1;     // shift-right (new bit into CNT[23])
+    ch->CTRL.B.ISL        = 0;     // use filtered input (F_OUT) as data source
+    ch->CTRL.B.CNTS_SEL   = 0;     // in TSSM: shift-out source selection (leave default unless needed)
+
+    // Capture CNT into GPR1 on NEWVAL
+    ch->CTRL.B.EGPR1_SEL  = 0;
+    ch->CTRL.B.GPR1_SEL   = 0x3;   // CNT -> GPR1
+
+    // Word length = 13 bits
+    ch->CNTS.U = 0;
+    ch->CNTS.B.CNTS = (RX_WORD_LENGTH_BITS - 1);
+
+    // --- External capture mode: shifting only on EXT_CAP pulses ---
+    ch->CTRL.B.EXT_CAP_EN = 1;     // “input event changes ignored; only sensitive to external capture pulses”
+
+    // EXT_CAP source = local tdu_sample_evt (0xC)  (from your ECTRL table)
+    ch->ECTRL.B.EXT_CAP_SRC = 0xC;
+
+    // No fast ISR:
+    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0;
+    ch->IRQ.EN.B.TODET_IRQ_EN  = 0;  // we'll use DMA/one IRQ later if desired
+
     ch->CTRL.B.TIM_EN = 1;
 }
 
