@@ -14,7 +14,7 @@
 
 
 // ---------------------- CONFIGURATION & DEFINES (Moved to Top) ----------------------
-#define FREQUENCY   1e6
+#define FREQUENCY   1e5
 #define SYS_FREQ    96e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
@@ -63,14 +63,10 @@ static void initGtmCmu(void);
 static void initAtomClock(void);
 static void initAtomTx(void);
 static void initAtomDir(void);
-static void initTimRx_Tdu_2x13(void);
 static void initTimRx_Tssm(void);
 static void initPins(void);
 static void initDmaRx(void);
 unsigned int MakeCrcPos(unsigned int clocks, unsigned int error1, unsigned int error2, unsigned int endat22, unsigned long highpos, unsigned long lowpos);
-
-// Requested API
-void prepareModeTransmission(void);
 void fireTransmission(void);
 
 // =========================================================
@@ -81,15 +77,20 @@ void fireTransmission(void);
 static volatile uint32 pos_frame = 0;
 volatile int captured_words = 0;
 
-IFX_INTERRUPT(timRxWordDoneISR, 0, ISR_PRIORITY_TIM0_CH0_NEWVAL);
-void timRxWordDoneISR(void)
+#define ISR_PRIORITY_TIM0_CH0_TODET  11
+
+IFX_INTERRUPT(timRxTodetWordISR, 0, ISR_PRIORITY_TIM0_CH0_TODET);
+void timRxTodetWordISR(void)
 {
-    //if(captured_words > 1) return;
     IfxPort_togglePin(DBG_DMA_PIN);
-    //uint16_t word = (tim->CH0.GPR1.U >> 11) & 0x1FFF;
-    //pos_frame |= (captured_words++ == 0) ? (word) : (word << 13);
-    IfxPort_togglePin(DBG_DMA_PIN);
+
+    // Clear sticky TODET notification bit
+    //MODULE_GTM.TIM[0].CH0.IRQ.NOTIFY.B.TODET = 1;
+
+    // Clear service request (important to avoid repeated firing)
+    //IfxSrc_clearRequest(&SRC_GTM_TIM0_0);
 }
+
 
 // 1. DMA Interrupt: Fires after 2 segments are received (TCOUNT reaches 0)
 IFX_INTERRUPT(dmaRxISR, 0, ISR_PRIORITY_DMA_RX);
@@ -130,26 +131,6 @@ void timRxStartISR(void)
 // =========================================================
 // API & Logic
 // =========================================================
-
-/**
- * Stop timers, reset state, and prepare for the next transmission.r
- * Called inside ISR and can also be called from main/task context.
- */
-void prepareModeTransmission(void)
-{
-    /* 0) stop shifter + stop bit clock so nothing can create requests */
-    MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 0;
-    MODULE_GTM.CMU.CLK_EN.U &= ~(1u << 1);
-
-    /* 2) clear pending service request on the TIM0_0 SRC line */
-    IfxSrc_clearRequest(&SRC_GTM_TIM0_0);
-    IfxSrc_clearRequest(&SRC_GTM_TIM0_1);
-    MODULE_GTM.TIM[0].CH1.IRQ.NOTIFY.B.NEWVAL = 1;   // clear CH1 NEWVAL too
-
-    /* your existing output disables are fine */
-    agc->OUTEN_STAT.U = 0x55;
-    MODULE_GTM.CMU.CLK_EN.U = 0x5;
-}
 
 /**
  * Start a single transmission frame.
@@ -193,7 +174,6 @@ void init(void)
     initAtomClock();
 
     initTimRx_Tssm();
-    initTimRx_Tdu_2x13();
     initDmaRx();
 
     initPins();
@@ -331,7 +311,7 @@ static void initGtmCmu(void)
 {
     // CMU_CLK0 = fast (for debug, etc.)
     IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_0, SYS_FREQ);
-    MODULE_GTM.CMU.CLK_EN.U = 0xA;     // enable clocks FIRST
+    MODULE_GTM.CMU.CLK_EN.U = 0x2;     // enable clocks FIRST
 
     // Do not enable clocks here; fireTransmission() will enable them
 }
@@ -412,103 +392,64 @@ static void initAtomDir(void)
     agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
 }
 
-// You must choose these based on your protocol timing:
-#define BIT_TICKS     16u   // example: sample every 16 ticks of CMU_TDU_CLK
-#define PHASE_TICKS   8u    // example: first sample 8 ticks after start edge
-
-static void initTimRx_Tdu_2x13(void)
-{
-    Ifx_GTM_TIM_CH *ch = timCh(0);
-
-    // Disable channel while programming TDU/ECTRL
-    ch->CTRL.B.TIM_EN = 0;
-
-    // ------------- Select which edges drive the TDU "active edge" -------------
-    // CTRL.TOCTRL: 01 = enabled for rising edge only (your pasted field)
-    ch->CTRL.B.TOCTRL = 0x1;   // startbit is rising edge
-
-    // ------------- TDU clock + slicing -------------
-    // TDUV.TCS: 001 = CMU_CLK1 (your pasted table)
-    ch->TDUV.B.TCS = 0x1;
-
-    // TDUV.SLICING: 10 = 3x8-bit counters (your pasted table)
-    ch->TDUV.B.SLICING = 0x2;
-
-    // Use tdu_sample_evt as Timeout Clock for TO_CNT (TO_CNT2 still uses CMU_CLK(TCS))
-    // This creates: TO_CNT2 (CMU) -> tdu_sample_evt; TO_CNT counts those sample events.
-    ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1;
-
-    // Ensure TO_CNT1 is clocked on tdu_word_evt (default behavior when TDU_SAME_CNT_CLK=0)
-    ch->TDUV.B.TDU_SAME_CNT_CLK = 0;
-
-    // ------------- Program compare values -------------
-    // With SLICING=10 and TCS_USE_SAMPLE_EVT=1:
-    // - TO_CNT2 clocked by CMU_CLK1: its compare defines sample cadence
-    // - TO_CNT clocked by tdu_sample_evt: its compare defines word cadence
-    // - TO_CNT1 clocked by tdu_word_evt: its compare defines frame cadence
-
-    // Make tdu_sample_evt happen EVERY 1 CMU_CLK1 tick => 16 MHz sample pulses
-    // (compare at 0 means "every tick" in typical compare-to-zero style; if your silicon behaves as N+1,
-    // set to 0 for 1-tick period, set to (period-1) for N-tick period.)
-    ch->TDUV.B.TOV2 = 0;                    // sample period = 1 tick of CMU_CLK1 (16 MHz)
-
-    // Make tdu_word_evt after 13 samples
-    ch->TDUV.B.TOV  = (RX_WORD_LENGTH_BITS - 1);   // 12 => 13 sample events
-
-    // Make tdu_frame_evt after 2 words
-    ch->TDUV.B.TOV1 = (RX_SEGS - 1);        // 1 => 2 word events
-
-    // ------------- Start/Stop/Resync policy -------------
-    // Start once on first active edge selected by TOCTRL (rising) (your pasted encoding)
-    ch->ECTRL.B.TDU_START = 0x3;
-
-    // Stop on tdu_frame_evt (after 2 words) (your pasted encoding)
-    ch->ECTRL.B.TDU_STOP  = 0x2;
-
-    // Resync: simplest deterministic choice for slicing!=11 is 0000:
-    // resets counters on each active edge selected by TOCTRL etc. (your Table 46)
-    // This ensures the chain always starts aligned to the detected start edge.
-    ch->ECTRL.B.TDU_RESYNC = 0x0;
-
-    // Optional: Make TODET_IRQ represent "frame done" (tdu_frame_evt)
-    // This gives you a single “frame done” notification source (IRQ/DMA) without touching NEWVAL.
-    ch->ECTRL.B.TODET_IRQ_SRC = 0x2; // 10 = tdu_frame_evt (from your pasted table)
-
-    // Re-enable channel
-    ch->CTRL.B.TIM_EN = 1;
-}
+#define BIT_TICKS     (SYS_FREQ / FREQUENCY)   // 96
+#define PHASE_TICKS   (BIT_TICKS / 2)          // 48
 
 static void initTimRx_Tssm(void)
 {
     Ifx_GTM_TIM_CH *ch = timCh(0);
 
-    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_noPullDevice);
-
     ch->CTRL.B.TIM_EN = 0;
 
-    // --- TSSM setup ---
-    ch->CTRL.B.TIM_MODE   = 0x6;   // TSSM
-    ch->CTRL.B.DSL        = 1;     // shift-right (new bit into CNT[23])
-    ch->CTRL.B.ISL        = 0;     // use filtered input (F_OUT) as data source
-    ch->CTRL.B.CNTS_SEL   = 0;     // in TSSM: shift-out source selection (leave default unless needed)
+    // 1. PIN SETUP: Enable Pull-Up to prevent floating noise triggers
+    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullUp);
 
-    // Capture CNT into GPR1 on NEWVAL
+    // --- TSSM Setup ---
+    ch->CTRL.B.TIM_MODE   = 0x6;
+    ch->CTRL.B.DSL        = 1;
+    ch->CTRL.B.ISL        = 0;
+    ch->CTRL.B.CNTS_SEL   = 0;
     ch->CTRL.B.EGPR1_SEL  = 0;
-    ch->CTRL.B.GPR1_SEL   = 0x3;   // CNT -> GPR1
+    ch->CTRL.B.GPR1_SEL   = 0x3;
 
-    // Word length = 13 bits
     ch->CNTS.U = 0;
     ch->CNTS.B.CNTS = (RX_WORD_LENGTH_BITS - 1);
 
-    // --- External capture mode: shifting only on EXT_CAP pulses ---
-    ch->CTRL.B.EXT_CAP_EN = 1;     // “input event changes ignored; only sensitive to external capture pulses”
+    // --- External Capture ---
+    ch->CTRL.B.EXT_CAP_EN = 1;
+    ch->ECTRL.B.EXT_CAP_SRC = 0xC; // TDU Sample Event
 
-    // EXT_CAP source = local tdu_sample_evt (0xC)  (from your ECTRL table)
-    ch->ECTRL.B.EXT_CAP_SRC = 0xC;
+    // 2. EDGE SELECTION: Check your signal polarity!
+    // 0x0 = Falling Edge (Standard for Idle-High Start Bits)
+    // 0x1 = Rising Edge (Only if your line is Idle-Low)
+    ch->CTRL.B.TOCTRL = 0x0;
 
-    // No fast ISR:
-    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0;
-    ch->IRQ.EN.B.TODET_IRQ_EN  = 0;  // we'll use DMA/one IRQ later if desired
+    // --- TDU TIMING FIX ---
+    ch->TDUV.B.TCS = 0x0;
+    ch->TDUV.B.SLICING = 0x2;
+    ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1;
+    ch->TDUV.B.TDU_SAME_CNT_CLK = 0;
+
+    // FIX: Set TOV2 to the full bit period (96MHz / 100kHz = 960 ticks)
+    ch->TDUV.B.TOV2 = PERIOD - 1;
+
+    ch->TDUV.B.TOV  = (RX_WORD_LENGTH_BITS - 1);
+    ch->TDUV.B.TOV1 = (RX_SEGS - 1);
+
+    // TDU Control
+    ch->ECTRL.B.TDU_START = 0x1; // Wait for active edge (defined by TOCTRL)
+    ch->ECTRL.B.TDU_STOP  = 0x2; // Stop on Frame
+    ch->ECTRL.B.TDU_RESYNC = 0x0;
+    ch->ECTRL.B.TODET_IRQ_SRC = 0x3;
+
+    // --- Interrupt Setup ---
+    ch->IRQ.EN.B.TODET_IRQ_EN = 1;
+    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0; // Keep disabled to avoid flood
+    ch->IRQ.MODE.B.IRQ_MODE = 0x2;
+
+    // Ensure SRC is cleared before enabling
+    IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_TODET);
+    IfxSrc_enable(&SRC_GTM_TIM0_0);
 
     ch->CTRL.B.TIM_EN = 1;
 }
