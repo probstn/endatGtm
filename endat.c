@@ -15,7 +15,7 @@
 
 // ---------------------- CONFIGURATION & DEFINES (Moved to Top) ----------------------
 #define FREQUENCY   1e5
-#define SYS_FREQ    96e6
+#define SYS_FREQ    1e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
 #define RX_WORD_LENGTH_BITS     13u
@@ -401,58 +401,64 @@ static void initTimRx_Tssm(void)
 
     ch->CTRL.B.TIM_EN = 0;
 
-    // 1. PIN SETUP: Enable Pull-Up to prevent floating noise triggers
     IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullUp);
 
-    // --- TSSM Setup ---
-    ch->CTRL.B.TIM_MODE   = 0x6;
-    ch->CTRL.B.DSL        = 1;
-    ch->CTRL.B.ISL        = 0;
-    ch->CTRL.B.CNTS_SEL   = 0;
-    ch->CTRL.B.EGPR1_SEL  = 0;
-    ch->CTRL.B.GPR1_SEL   = 0x3;
+    // ---- TSSM ----
+    ch->CTRL.B.TIM_MODE = 0x6;   // TSSM
+    ch->CTRL.B.DSL      = 1;     // in TSSM: shift direction (1 = shift right)
+    // ch->CTRL.B.ISL    = ...    // meaning is mode-dependent; don't rely on it here
 
-    ch->CNTS.U = 0;
-    ch->CNTS.B.CNTS = (RX_WORD_LENGTH_BITS - 1);
+    // Shift length (CNTS used as length in TSSM)
+    ch->CNTS.B.CNTS = 13 - 1;
 
-    // --- External Capture ---
-    ch->CTRL.B.EXT_CAP_EN = 1;
-    ch->ECTRL.B.EXT_CAP_SRC = 0xC; // TDU Sample Event
+    // ---- External capture clocks the shift (sample events) ----
+    ch->CTRL.B.EXT_CAP_EN     = 1;
+    ch->ECTRL.B.EXT_CAP_SRC   = 0xC;   // tdu_sample_evt (per UM)
 
-    // 2. EDGE SELECTION: Check your signal polarity!
-    // 0x0 = Falling Edge (Standard for Idle-High Start Bits)
-    // 0x1 = Rising Edge (Only if your line is Idle-Low)
-    ch->CTRL.B.TOCTRL = 0x0;
+    // ---- Timeout unit used ONLY to define "active edge" for TDU_START ----
+    ch->CTRL.B.TOCTRL         = 0x1;   // enable timeout for rising edge only => rising is "active"
 
-    // --- TDU TIMING FIX ---
-    ch->TDUV.B.TCS = 0x0;
-    ch->TDUV.B.SLICING = 0x2;
+    // ---- TDU: use CMU clock, generate sample events periodically ----
     ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1;
-    ch->TDUV.B.TDU_SAME_CNT_CLK = 0;
+    ch->TDUV.B.TCS               = 0;
+    ch->TDUV.B.SLICING           = 0x2;
 
-    // FIX: Set TOV2 to the full bit period (96MHz / 100kHz = 960 ticks)
-    ch->TDUV.B.TOV2 = PERIOD - 1;
 
-    ch->TDUV.B.TOV  = (RX_WORD_LENGTH_BITS - 1);
-    ch->TDUV.B.TOV1 = (RX_SEGS - 1);
+    ch->TDUV.B.TOV1  = 0xFF;
+    ch->TDUV.B.TOV2  = (BIT_TICKS - 1);
+    ch->TDUV.B.TOV  = 26-1;
 
-    // TDU Control
-    ch->ECTRL.B.TDU_START = 0x1; // Wait for active edge (defined by TOCTRL)
-    ch->ECTRL.B.TDU_STOP  = 0x2; // Stop on Frame
-    ch->ECTRL.B.TDU_RESYNC = 0x0;
-    ch->ECTRL.B.TODET_IRQ_SRC = 0x3;
+    // Start TDU on first rising edge (active edge via TOCTRL)
+    ch->ECTRL.B.TDU_START  = 0x2;  // start once on first active edge selected by TOCTRL
+    ch->ECTRL.B.TDU_STOP   = 0x0;  // don't stop early while debugging
+    ch->ECTRL.B.TDU_RESYNC = 0x0;  // keep simple first
+    ch->ECTRL.B.TODET_IRQ_SRC = 0x1;
 
-    // --- Interrupt Setup ---
-    ch->IRQ.EN.B.TODET_IRQ_EN = 1;
-    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0; // Keep disabled to avoid flood
-    ch->IRQ.MODE.B.IRQ_MODE = 0x2;
 
-    // Ensure SRC is cleared before enabling
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ---- Interrupt: use NEWVAL for "done" ----
+    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0;
+    ch->IRQ.EN.B.TODET_IRQ_EN  = 1;
+    ch->IRQ.MODE.B.IRQ_MODE    = 0x2;  // single-pulse is fine
+
     IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_TODET);
     IfxSrc_enable(&SRC_GTM_TIM0_0);
 
     ch->CTRL.B.TIM_EN = 1;
 }
+
 
 static void initPins(void) {
     IfxGtm_PinMap_setAtomTout(clock_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
