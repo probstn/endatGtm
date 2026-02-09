@@ -77,7 +77,14 @@ void fireTransmission(void);
 static volatile uint32 pos_frame = 0;
 volatile int captured_words = 0;
 
-#define ISR_PRIORITY_TIM0_CH0_TODET  11
+#define ISR_PRIORITY_TIM0_CH0_TODET  12
+#define ISR_PRIORITY_ATOM0_CH1_CCU0TC  11
+IFX_INTERRUPT(directionDoneISR, 0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
+void directionDoneISR(void)
+{
+    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullDown);
+    //IfxPort_togglePin(DBG_DMA_PIN);
+}
 
 IFX_INTERRUPT(timRxTodetWordISR, 0, ISR_PRIORITY_TIM0_CH0_TODET);
 void timRxTodetWordISR(void)
@@ -386,79 +393,92 @@ static void initAtomDir(void)
     ch->SR1.U = 0x7Fu << (24 - 8); // example pattern
     ch->SR0.U = 8u;
 
+    ch->IRQ.EN.B.CCU0TC_IRQ_EN = 1;
+    ch->IRQ.MODE.B.IRQ_MODE = 0x2;
+
+    IfxSrc_init(&SRC_GTM_ATOM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
+    IfxSrc_enable(&SRC_GTM_ATOM0_1);
+
     agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;
     agc->GLB_CTRL.B.UPEN_CTRL2    = 2;
     agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;
     agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
 }
 
-#define BIT_TICKS     (SYS_FREQ / FREQUENCY)   // 96
-#define PHASE_TICKS   (BIT_TICKS / 2)          // 48
-
 static void initTimRx_Tssm(void)
 {
     Ifx_GTM_TIM_CH *ch = timCh(0);
 
+    // 1. Disable channel to ensure safe configuration
     ch->CTRL.B.TIM_EN = 0;
 
-    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullUp);
+    // 2. Configure Input Pin
+//    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullDown);
 
-    // ---- TSSM ----
-    ch->CTRL.B.TIM_MODE = 0x6;   // TSSM
-    ch->CTRL.B.DSL      = 1;     // in TSSM: shift direction (1 = shift right)
-    // ch->CTRL.B.ISL    = ...    // meaning is mode-dependent; don't rely on it here
+    // -------------------------------------------------------------------------
+    // TSSM (Shift Register) Configuration
+    // -------------------------------------------------------------------------
+    ch->CTRL.B.TIM_MODE = 0x6;   // TSSM (Serial Shift Mode)
+    ch->CTRL.B.DSL      = 1;     // Shift direction (1 = shift right)
 
-    // Shift length (CNTS used as length in TSSM)
-    ch->CNTS.B.CNTS = 13 - 1;
-
-    // ---- External capture clocks the shift (sample events) ----
+    // Enable External Capture: This allows the TDU to clock the shift register
     ch->CTRL.B.EXT_CAP_EN     = 1;
-    ch->ECTRL.B.EXT_CAP_SRC   = 0xC;   // tdu_sample_evt (per UM)
+    // Select TDU Sample Event as the shift clock source [cite: 799]
+    ch->ECTRL.B.EXT_CAP_SRC   = 0xC;   // 0xC = tdu_sample_evt
 
-    // ---- Timeout unit used ONLY to define "active edge" for TDU_START ----
-    ch->CTRL.B.TOCTRL         = 0x1;   // enable timeout for rising edge only => rising is "active"
+    // -------------------------------------------------------------------------
+    // TDU Configuration (Baud Rate & Bit Counter)
+    // -------------------------------------------------------------------------
+    // Use 3x 8-bit Slicing: Allows parallel Baud Gen (Slice 2) and Bit Count (Slice 0)
+    ch->TDUV.B.SLICING        = 0x2;   // 0b10 = 3x 8-bit mode [cite: 700]
 
-    // ---- TDU: use CMU clock, generate sample events periodically ----
-    ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1;
-    ch->TDUV.B.TCS               = 0;
-    ch->TDUV.B.SLICING           = 0x2;
+    // --- Clocking ---
+    ch->TDUV.B.TCS            = 0;     // Slice 2 counts CMU_CLK0
+    ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1; // Slice 0 counts tdu_sample_evt [cite: 700]
 
+    // --- Counter Values ---
+    // Slice 2 (Baud Generator): Fires 'tdu_sample_evt' every bit period
+    ch->TDUV.B.TOV2  = (PERIOD - 1);
 
-    ch->TDUV.B.TOV1  = 0xFF;
-    ch->TDUV.B.TOV2  = (BIT_TICKS - 1);
-    ch->TDUV.B.TOV  = 26-1;
+    // Slice 0 (Bit Counter): Fires 'tdu_word_evt' after 26 events
+    // In 3x8 mode, Slice 0 generates tdu_word_evt when TO_CNT >= TOV [cite: 38]
+    ch->TDUV.B.TOV   = 26;
 
-    // Start TDU on first rising edge (active edge via TOCTRL)
-    ch->ECTRL.B.TDU_START  = 0x2;  // start once on first active edge selected by TOCTRL
-    ch->ECTRL.B.TDU_STOP   = 0x0;  // don't stop early while debugging
-    ch->ECTRL.B.TDU_RESYNC = 0x0;  // keep simple first
-    ch->ECTRL.B.TODET_IRQ_SRC = 0x1;
-
-
-
-
-
-
-
-
-
-
+    // -------------------------------------------------------------------------
+    // Start / Stop Logic
+    // -------------------------------------------------------------------------
+    // Start Behavior: Start on active edge. If stopped, RESTART on next active edge.
+    ch->ECTRL.B.TDU_START     = 0x7;   // 0b111 = Start/restart on active edge [cite: 806]
+    // Define "Active Edge" as Rising Edge
+    ch->CTRL.B.TOCTRL         = 0x1;   // 0x1 = Rising Edge only [cite: 240]
 
 
+    // Stop Behavior: Stop automatically when Bit Counter (Slice 0) hits limit.
+    // Slice 0 generates 'tdu_word_evt' (see Table 30 in manual).
+    ch->ECTRL.B.TDU_STOP      = 0x1;   // 0b001 = Stop on tdu_word_evt [cite: 806]
 
+    // Reset counters to 0 upon Start
+    ch->ECTRL.B.TDU_RESYNC    = 0xA;
+    ch->TDUC.B.TO_CNT = 0;
+    ch->TDUC.B.TO_CNT1 = 0;
+    ch->TDUC.B.TO_CNT2 = 0;
+    // -------------------------------------------------------------------------
+    // Interrupts
+    // -------------------------------------------------------------------------
+    // Map the "Done" event (tdu_word_evt) to the TODET interrupt [cite: 799]
+    ch->ECTRL.B.TODET_IRQ_SRC = 0x3;   // 0x1 = Use tdu_word_evt for TODET
 
-
-    // ---- Interrupt: use NEWVAL for "done" ----
     ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0;
-    ch->IRQ.EN.B.TODET_IRQ_EN  = 1;
-    ch->IRQ.MODE.B.IRQ_MODE    = 0x2;  // single-pulse is fine
+    ch->IRQ.EN.B.TODET_IRQ_EN  = 1;    // Enable Timeout/Done interrupt
+    ch->IRQ.MODE.B.IRQ_MODE    = 0x2;  // Pulse mode
 
+    // Initialize SRC (Service Request Control)
     IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_TODET);
     IfxSrc_enable(&SRC_GTM_TIM0_0);
 
+    // 3. Enable Channel
     ch->CTRL.B.TIM_EN = 1;
 }
-
 
 static void initPins(void) {
     IfxGtm_PinMap_setAtomTout(clock_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
