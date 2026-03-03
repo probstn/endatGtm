@@ -15,7 +15,7 @@
 
 // ---------------------- CONFIGURATION & DEFINES (Moved to Top) ----------------------
 #define FREQUENCY   1e5
-#define SYS_FREQ    1e6
+#define SYS_FREQ    100e6
 #define PERIOD      ((uint32)(SYS_FREQ / FREQUENCY))
 
 #define RX_WORD_LENGTH_BITS     13u
@@ -72,12 +72,15 @@ void fireTransmission(void);
 static void initAtomRxClock(void);
 static void initAtomSlaveSelect(void);
 
-#define ISR_PRIORITY_TIM0_CH4_NEWVAL  8
-IFX_INTERRUPT(isrTim0Ch4Newval, 0, ISR_PRIORITY_TIM0_CH4_NEWVAL);
+#define ISR_PRIORITY_ATOM0_CH1_CCU0TC  10
+IFX_INTERRUPT(atomDirShiftCompleteIsr, 0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
 
-void isrTim0Ch4Newval(void)
+void atomDirShiftCompleteIsr(void)
 {
+//    initTimStartBitDetect();
     IfxPort_togglePin(DBG_START_PIN);
+    initTimStartBitDetect();
+
 }
 
 /**
@@ -86,12 +89,10 @@ void isrTim0Ch4Newval(void)
  */
 void fireTransmission(void)
 {
-
     atom->CH1.CN0.U = 0;
     atom->CH2.CN0.U = 0;
     atom->CH3.CN0.U = 0;
     agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
-    //agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
 }
 
 void init(void)
@@ -107,7 +108,7 @@ void init(void)
     initAtomDir();
     initAtomTxClock();
     initAtomRxClock();
-    initTimStartBitDetect();
+
     initAtomSlaveSelect();
     initDmaRx();
 
@@ -119,7 +120,6 @@ void init(void)
 
     while(true)
     {
-
     }
 }
 
@@ -238,8 +238,8 @@ static void initAtomTx(void)
     ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
     ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
-    ch->SR1.U = 0x7u << (24 - 7); // example pattern
-    ch->SR0.U = 7u;
+    ch->SR1.U = 0x7u << (24 - 8); // example pattern
+    ch->SR0.U = 8u;
 
     agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;
     agc->GLB_CTRL.B.UPEN_CTRL2    = 2;
@@ -265,14 +265,19 @@ static void initAtomDir(void)
     //ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
     //ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
-    ch->SR1.U = 0x7Fu << (24 - 7); // example pattern
-    ch->SR0.U = 7u;
+    ch->SR1.U = 0x7Fu << (24 - 8); // example pattern
+    ch->SR0.U = 8u;
 
+
+    // 1. Enable the CCU0TC interrupt (triggers when CN0 reaches CM0)
     ch->IRQ.EN.B.CCU0TC_IRQ_EN = 1;
-    ch->IRQ.MODE.B.IRQ_MODE = 0x2;
+    ch->IRQ.EN.B.CCU1TC_IRQ_EN = 1;
+    ch->IRQ.MODE.B.IRQ_MODE = 0x2; // Pulse-Notify mode (standard for AURIX GTM IRQs)
 
-//    IfxSrc_init(&SRC_GTM_ATOM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
-//    IfxSrc_enable(&SRC_GTM_ATOM0_1);
+    IfxSrc_init(&SRC_GTM_ATOM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
+    IfxSrc_enable(&SRC_GTM_ATOM0_1);
+    // 2. Route the interrupt to CPU0 (Assuming ATOM0 and Channel 3)
+    // Make sure SRC_GTM_ATOM0_3 matches your actual ATOM instance and channel!
 
     agc->OUTEN_CTRL.B.OUTEN_CTRL3 = 2;
     agc->GLB_CTRL.B.UPEN_CTRL3    = 2;
@@ -308,26 +313,36 @@ static void initTimStartBitDetect(void)
 static void initAtomSlaveSelect(void)
 {
     Ifx_GTM_ATOM_CH *ch = atomCh(ss_pin->channel);
-    uint32 ticks = 26u * PERIOD;
 
+    // Basic Configuration
     ch->CTRL.B.MODE       = 2;   // SOMP
     ch->CTRL.B.CLK_SRC_SR = 0;   // CMU_CLK0
     ch->CTRL.B.OSM        = 1;   // one-shot
     ch->CTRL.B.SL         = 1;   // pulse level HIGH (idle LOW)
-
     ch->CTRL.B.RST_CCU0   = 0;   // must be 0 when using OSM_TRIG
     ch->CTRL.B.OSM_TRIG   = 1;   // START one-shot on trigger
-    ch->CTRL.B.EXT_TRIG   = 1;   //signal TIM_EXT_CAPTURE[x] is selected
+    ch->CTRL.B.EXT_TRIG   = 1;   // signal TIM_EXT_CAPTURE[x] is selected
 
-    ch->CM1.U = ticks;       // time until second edge
-    ch->CM0.U = ticks + 1u;  // stop condition
+    // --- The Immediate 26-Cycle Pulse Setup ---
+    uint32 pulseCycles = 26*PERIOD;
+    uint32 totalCycles = pulseCycles + 2; // CM0 must be > CM1
 
+    // 1. Set Active and Shadow Compare Registers
+    ch->CM1.U = pulseCycles;     // Pulse ends at 26
+    ch->SR1.U = pulseCycles;
+
+    ch->CM0.U = totalCycles;     // Period is 28
+    ch->SR0.U = totalCycles;
+
+    // 2. Pre-load the counter to 1 tick before rollover
+    ch->CN0.U = totalCycles +1; // Starts at 27. Rolls to 0 on first tick.
+
+    // Enable Outputs
     agc->OUTEN_CTRL.B.OUTEN_CTRL5 = 2;
-    agc->GLB_CTRL.B.UPEN_CTRL5    = 0;
     agc->ENDIS_CTRL.B.ENDIS_CTRL5 = 2;
-    agc->FUPD_CTRL.B.RSTCN0_CH5   = 2;
 
-    agc->GLB_CTRL.B.HOST_TRIG = 1;
+    // Force shadow update just to be perfectly safe
+    agc->FUPD_CTRL.B.FUPD_CTRL5 = 2;
 }
 
 static void initPins(void)
@@ -338,5 +353,5 @@ static void initPins(void)
     IfxGtm_PinMap_setAtomTout(dir_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
     IfxGtm_PinMap_setAtomTout(rx_clk_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
 
-    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullDown);
+    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_noPullDevice);
 }
