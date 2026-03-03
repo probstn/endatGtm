@@ -35,16 +35,18 @@ static Ifx_GTM_ATOM_AGC *agc  = NULL_PTR;
 static Ifx_GTM_TIM      *tim  = NULL_PTR;
 
 // ---------------------- Pin maps ------------------------
-static const IfxGtm_Atom_ToutMap *clock_pin = &IfxGtm_ATOM0_0_TOUT53_P21_2_OUT;
-static const IfxGtm_Atom_ToutMap *tx_pin    = &IfxGtm_ATOM0_1_TOUT47_P22_0_OUT;
-static const IfxGtm_Atom_ToutMap *dir_pin   = &IfxGtm_ATOM0_2_TOUT2_P02_2_OUT;
-static const IfxGtm_Atom_ToutMap *cmu_pin   = &IfxGtm_ATOM0_3_TOUT3_P02_3_OUT;
-static const IfxGtm_Tim_TinMap   *rx_pin    = &IfxGtm_TIM0_0_P02_0_IN;
+static const IfxGtm_Atom_ToutMap *ss_pin = &IfxGtm_ATOM0_5_TOUT5_P02_5_OUT;
+static const IfxGtm_Atom_ToutMap *tx_clk_pin    = &IfxGtm_ATOM0_1_TOUT1_P02_1_OUT;
+static const IfxGtm_Atom_ToutMap *tx_pin   = &IfxGtm_ATOM0_2_TOUT2_P02_2_OUT;
+static const IfxGtm_Atom_ToutMap *dir_pin   = &IfxGtm_ATOM0_3_TOUT3_P02_3_OUT;
+static const IfxGtm_Atom_ToutMap *rx_clk_pin   = &IfxGtm_ATOM0_4_TOUT4_P02_4_OUT;
+
+static const IfxGtm_Tim_TinMap   *rx_pin    = &IfxGtm_TIM0_5_P23_0_IN;
 
 #define DBG_DMA_PIN     &MODULE_P14,6
-#define DBG_START_PIN     &MODULE_P02,5
+#define DBG_START_PIN     &MODULE_P02,7
 
-// ---------------------- Global Vars ----------------------
+// ---------------------- Global Var -----------------------
 static IfxDma_Dma dma;
 static IfxDma_Dma_Channel dmaCh;
 
@@ -60,84 +62,23 @@ static inline Ifx_GTM_TIM_CH *timCh(uint8 ch) {
 // ---------------------- Forward decl ---------------------
 static void initGtmBase(void);
 static void initGtmCmu(void);
-static void initAtomClock(void);
+static void initAtomTxClock(void);
 static void initAtomTx(void);
 static void initAtomDir(void);
-static void initTimRx_Tssm(void);
+static void initTimStartBitDetect(void);
 static void initPins(void);
 static void initDmaRx(void);
-unsigned int MakeCrcPos(unsigned int clocks, unsigned int error1, unsigned int error2, unsigned int endat22, unsigned long highpos, unsigned long lowpos);
 void fireTransmission(void);
+static void initAtomRxClock(void);
+static void initAtomSlaveSelect(void);
 
-// =========================================================
-// INTERRUPT SERVICE ROUTINES
-// =========================================================
-#define ISR_PRIORITY_TIM0_CH0_NEWVAL  11
+#define ISR_PRIORITY_TIM0_CH4_NEWVAL  8
+IFX_INTERRUPT(isrTim0Ch4Newval, 0, ISR_PRIORITY_TIM0_CH4_NEWVAL);
 
-static volatile uint32 pos_frame = 0;
-volatile int captured_words = 0;
-
-#define ISR_PRIORITY_TIM0_CH0_TODET  12
-#define ISR_PRIORITY_ATOM0_CH1_CCU0TC  11
-IFX_INTERRUPT(directionDoneISR, 0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
-void directionDoneISR(void)
-{
-    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullDown);
-    //IfxPort_togglePin(DBG_DMA_PIN);
-}
-
-IFX_INTERRUPT(timRxTodetWordISR, 0, ISR_PRIORITY_TIM0_CH0_TODET);
-void timRxTodetWordISR(void)
-{
-    IfxPort_togglePin(DBG_DMA_PIN);
-
-    // Clear sticky TODET notification bit
-    //MODULE_GTM.TIM[0].CH0.IRQ.NOTIFY.B.TODET = 1;
-
-    // Clear service request (important to avoid repeated firing)
-    //IfxSrc_clearRequest(&SRC_GTM_TIM0_0);
-}
-
-
-// 1. DMA Interrupt: Fires after 2 segments are received (TCOUNT reaches 0)
-IFX_INTERRUPT(dmaRxISR, 0, ISR_PRIORITY_DMA_RX);
-
-void dmaRxISR(void)
-{
-    IfxPort_togglePin(DBG_DMA_PIN);
-
-    /*
-
-    // 1. Immediately stop the Shift Timer (TIM0_CH0) and Clock
-    MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 0;
-    MODULE_GTM.CMU.CLK_EN.U &= ~(1u << 1);
-
-    // 2. Debug toggle
-
-
-    // 4. Prepare system for the NEXT run (Reset DMA, Reset Flags)
-        prepareModeTransmission();
-    */
-}
-
-// 2. Start Interrupt: Fires on start bit edge (TIM0_CH1)
-IFX_INTERRUPT(timRxStartISR, 0, ISR_PRIORITY_RX_START);
-
-void timRxStartISR(void)
+void isrTim0Ch4Newval(void)
 {
     IfxPort_togglePin(DBG_START_PIN);
-
-    //IfxSrc_clearRequest(&SRC_GTM_TIM0_1);
-
-    /* Now start bit clock + shifter */
-    //MODULE_GTM.CMU.CLK_EN.U |= (1u << 1);
-    //MODULE_GTM.TIM[0].CH0.CTRL.B.TIM_EN = 1;
 }
-
-
-// =========================================================
-// API & Logic
-// =========================================================
 
 /**
  * Start a single transmission frame.
@@ -146,27 +87,13 @@ void timRxStartISR(void)
 void fireTransmission(void)
 {
 
-    atom->CH0.CN0.U = 0;
     atom->CH1.CN0.U = 0;
     atom->CH2.CN0.U = 0;
+    atom->CH3.CN0.U = 0;
     agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
     //agc->GLB_CTRL.B.HOST_TRIG = 1;     // now start is synchronous and deterministic
 }
 
-uint8_t reverse5(uint8_t b) {
-    b = ((b & 0xF) << 4) | ((b & 0xF0) >> 4); // Swap nibbles (only low 4 relevant first)
-    // Actually simpler for 5 bits:
-    uint8_t r = 0;
-    if (b & 0x01) r |= 0x10; // Bit 0 -> Bit 4
-    if (b & 0x02) r |= 0x08; // Bit 1 -> Bit 3
-    if (b & 0x04) r |= 0x04; // Bit 2 -> Bit 2
-    if (b & 0x08) r |= 0x02; // Bit 3 -> Bit 1
-    if (b & 0x10) r |= 0x01; // Bit 4 -> Bit 0
-    return r;
-}
-// =========================================================
-// Initialization
-// =========================================================
 void init(void)
 {
     // Use literal 0 instead of enum to avoid symbol errors
@@ -178,86 +105,22 @@ void init(void)
     initGtmCmu();
     initAtomTx();
     initAtomDir();
-    initAtomClock();
-
-    initTimRx_Tssm();
+    initAtomTxClock();
+    initAtomRxClock();
+    initTimStartBitDetect();
+    initAtomSlaveSelect();
     initDmaRx();
 
     initPins();
     IfxPort_setPinModeOutput(DBG_DMA_PIN, IfxPort_OutputMode_pushPull, IfxPort_OutputIdx_general);
     IfxPort_setPinModeOutput(DBG_START_PIN, IfxPort_OutputMode_pushPull, IfxPort_OutputIdx_general);
 
-    //agc->GLB_CTRL.B.HOST_TRIG = 1; //update all shadows
-
-    // Pre-arm the DMA for the very first run
-    //prepareModeTransmission();
-
     fireTransmission();
 
     while(true)
     {
 
-        if(captured_words > 1)
-        {
-            printf("%X\n", pos_frame & 0x3FFFFFF);
-            bool startbit = pos_frame & 1u;
-            bool faultbit = (pos_frame >> 1) & 1u;
-
-            uint32 position = (pos_frame >> 2) & 0x7FFFF;
-            //printf("%X\n", position);
-
-            uint8 crc = (pos_frame >> 21) & 0x1F; // 5-bit CRC
-            //uint8_t crc_calc = MakeCrcPos(19, faultbit, 0, 0, 0, position);
-            //printf("%.5X\n", crc);
-            //printf("%d %d %d %d\n", startbit, faultbit, position, crc);
-            break;
-        }
     }
-}
-
-unsigned int MakeCrcPos(unsigned int clocks, unsigned int error1, unsigned int error2, unsigned int endat22, unsigned long highpos, unsigned long lowpos)
-{
-    unsigned int ff[5]; // Zustand der 5 Flip-Flops
-    unsigned int code[66]; // Datenbit-Array
-    unsigned int ex; // Hilfsvariable
-    unsigned int crc = 0; // ermittelter CRC-Code
-    signed int i; // Laufvariable fC<r Schleifen
-
-    for(i = 0; i < 5; i++) // alle Flip-Flops auf 1 setzen
-        ff[i] = 1;
-    if (endat22) // alarm-Bits ins code-Array einlesen
-    {
-        code[0] = error1;
-        code[1] = error2;
-    }
-    else
-        code[1] = error1;
-    for(i = 2; i < 34; i++) // lowpos-Bits ins code-Array einlesen
-    {
-        code[i] = (lowpos & 0x00000001L) ? 1 : 0;
-        lowpos >>= 1;
-    }
-    for(i = 34; i < 66; i++) // highpos-Bits ins code-Array einlesen
-    {
-        code[i] = (highpos & 0x00000001L) ? 1 : 0;
-        highpos >>= 1;
-    }
-    for(i = (endat22 ? 0 : 1); i <= (clocks+1); i++)
-    {   // CRC berechnen, analog zur
-        ex = ff[4] ^ code[i]; // beschriebenen Generator-Hardware
-        ff[4] = ff[3];
-        ff[3] = ff[2] ^ ex;
-        ff[2] = ff[1];
-        ff[1] = ff[0] ^ ex;
-        ff[0] = ex;
-    }
-    for(i = 4; i >= 0; i--) // CRC in Variable ablegen
-    {
-        ff[i] = ff[i] ? 0 : 1; // Bits invertieren
-        crc <<= 1;
-        crc |= ff[i];
-    }
-    return crc;
 }
 
 static void initDmaRx(void)
@@ -303,9 +166,6 @@ static void initDmaRx(void)
     IfxDma_Dma_initChannel(&dmaCh, &chCfg);
 }
 
-// =========================================================
-// GTM base + CMU
-// =========================================================
 static void initGtmBase(void)
 {
     IfxGtm_enable(gtm);
@@ -318,17 +178,12 @@ static void initGtmCmu(void)
 {
     // CMU_CLK0 = fast (for debug, etc.)
     IfxGtm_Cmu_setClkFrequency(gtm, IfxGtm_Cmu_Clk_0, SYS_FREQ);
-    MODULE_GTM.CMU.CLK_EN.U = 0x2;     // enable clocks FIRST
-
-    // Do not enable clocks here; fireTransmission() will enable them
+    MODULE_GTM.CMU.CLK_EN.U = 0x2; //0b10 enables CMU0
 }
 
-// =========================================================
-// ATOM channels
-// =========================================================
-static void initAtomClock(void)
+static void initAtomTxClock(void)
 {
-    Ifx_GTM_ATOM_CH *ch = atomCh(clock_pin->channel);
+    Ifx_GTM_ATOM_CH *ch = atomCh(tx_clk_pin->channel);
 
     ch->CTRL.B.MODE       = 2;   // SOMP
     ch->CTRL.B.SL         = 0;
@@ -339,10 +194,30 @@ static void initAtomClock(void)
 
     ch->CTRL.B.TRIGOUT = 1;
 
-    agc->OUTEN_CTRL.B.OUTEN_CTRL0 = 2;  // enable output
-    agc->GLB_CTRL.B.UPEN_CTRL0    = 2;  // enable update
-    agc->ENDIS_CTRL.B.ENDIS_CTRL0 = 2;  // enable operation
-    //agc->FUPD_CTRL.B.RSTCN0_CH0 = 2;
+    agc->OUTEN_CTRL.B.OUTEN_CTRL1 = 2;  // enable output
+    agc->GLB_CTRL.B.UPEN_CTRL1    = 2;  // enable update
+    agc->ENDIS_CTRL.B.ENDIS_CTRL1 = 2;  // enable operation
+    //agc->FUPD_CTRL.B.RSTCN0_CH1 = 2;
+}
+
+static void initAtomRxClock(void)
+{
+    Ifx_GTM_ATOM_CH *ch = atomCh(rx_clk_pin->channel);
+
+    ch->CTRL.B.MODE       = 2;   // SOMP
+    ch->CTRL.B.SL         = 0;
+    ch->CTRL.B.CLK_SRC_SR = 0; //CMU0
+
+    ch->SR1.U = PERIOD/2;
+    ch->SR0.U = PERIOD;
+    ch->CN0.U = PERIOD/2-1;
+
+    ch->CTRL.B.TRIGOUT = 1;
+
+    agc->OUTEN_CTRL.B.OUTEN_CTRL4 = 2;  // enable output
+    agc->GLB_CTRL.B.UPEN_CTRL4    = 2;  // enable update
+    agc->ENDIS_CTRL.B.ENDIS_CTRL4 = 2;  // enable operation
+    //agc->FUPD_CTRL.B.RSTCN0_CH4 = 2;
 }
 
 static void initAtomTx(void)
@@ -363,13 +238,13 @@ static void initAtomTx(void)
     ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
     ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
-    ch->SR1.U = 0x7u << (24 - 8); // example pattern
+    ch->SR1.U = 0x7u << (24 - 7); // example pattern
     ch->SR0.U = 7u;
 
-    agc->OUTEN_CTRL.B.OUTEN_CTRL1 = 2;
-    agc->GLB_CTRL.B.UPEN_CTRL1    = 2;
-    agc->ENDIS_CTRL.B.ENDIS_CTRL1 = 2;
-    agc->FUPD_CTRL.B.RSTCN0_CH1 = 2;
+    agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;
+    agc->GLB_CTRL.B.UPEN_CTRL2    = 2;
+    agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
 }
 
 static void initAtomDir(void)
@@ -390,99 +265,78 @@ static void initAtomDir(void)
     //ch->CTRL.B.TRIGOUT    = 0;  // TRIG_[1] forwards TRIG_[0]
     //ch->CTRL.B.EXTTRIGOUT = 0;  // choose TRIG_[x-1] as forwarded signal
 
-    ch->SR1.U = 0x7Fu << (24 - 8); // example pattern
-    ch->SR0.U = 8u;
+    ch->SR1.U = 0x7Fu << (24 - 7); // example pattern
+    ch->SR0.U = 7u;
 
     ch->IRQ.EN.B.CCU0TC_IRQ_EN = 1;
     ch->IRQ.MODE.B.IRQ_MODE = 0x2;
 
-    IfxSrc_init(&SRC_GTM_ATOM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
-    IfxSrc_enable(&SRC_GTM_ATOM0_1);
+//    IfxSrc_init(&SRC_GTM_ATOM0_1, IfxSrc_Tos_cpu0, ISR_PRIORITY_ATOM0_CH1_CCU0TC);
+//    IfxSrc_enable(&SRC_GTM_ATOM0_1);
 
-    agc->OUTEN_CTRL.B.OUTEN_CTRL2 = 2;
-    agc->GLB_CTRL.B.UPEN_CTRL2    = 2;
-    agc->ENDIS_CTRL.B.ENDIS_CTRL2 = 2;
-    agc->FUPD_CTRL.B.RSTCN0_CH2 = 2;
+    agc->OUTEN_CTRL.B.OUTEN_CTRL3 = 2;
+    agc->GLB_CTRL.B.UPEN_CTRL3    = 2;
+    agc->ENDIS_CTRL.B.ENDIS_CTRL3 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH3 = 2;
 }
 
-static void initTimRx_Tssm(void)
+static void initTimStartBitDetect(void)
 {
-    Ifx_GTM_TIM_CH *ch = timCh(0);
+    Ifx_GTM_TIM_CH *ch = timCh(rx_pin->channel);
 
-    // 1. Disable channel to ensure safe configuration
     ch->CTRL.B.TIM_EN = 0;
 
-    // 2. Configure Input Pin
-//    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullDown);
+    ch->CTRL.B.TIM_MODE = 0x2;  // TIEM
+    ch->CTRL.B.DSL      = 1;    // rising edge active
+    ch->CTRL.B.ISL      = 0;    // use DSL
+    ch->CTRL.B.CICTRL   = 1;    // use TIM_IN[x]
+    ch->ECTRL.B.EXT_CAP_SRC = 0x3; //use TIM_IN[x] as trigger
 
-    // -------------------------------------------------------------------------
-    // TSSM (Shift Register) Configuration
-    // -------------------------------------------------------------------------
-    ch->CTRL.B.TIM_MODE = 0x6;   // TSSM (Serial Shift Mode)
-    ch->CTRL.B.DSL      = 1;     // Shift direction (1 = shift right)
+    ch->CTRL.B.TIM_EN   = 1;
 
-    // Enable External Capture: This allows the TDU to clock the shift register
-    ch->CTRL.B.EXT_CAP_EN     = 1;
-    // Select TDU Sample Event as the shift clock source [cite: 799]
-    ch->ECTRL.B.EXT_CAP_SRC   = 0xC;   // 0xC = tdu_sample_evt
-
-    // -------------------------------------------------------------------------
-    // TDU Configuration (Baud Rate & Bit Counter)
-    // -------------------------------------------------------------------------
-    // Use 3x 8-bit Slicing: Allows parallel Baud Gen (Slice 2) and Bit Count (Slice 0)
-    ch->TDUV.B.SLICING        = 0x2;   // 0b10 = 3x 8-bit mode [cite: 700]
-
-    // --- Clocking ---
-    ch->TDUV.B.TCS            = 0;     // Slice 2 counts CMU_CLK0
-    ch->TDUV.B.TCS_USE_SAMPLE_EVT = 1; // Slice 0 counts tdu_sample_evt [cite: 700]
-
-    // --- Counter Values ---
-    // Slice 2 (Baud Generator): Fires 'tdu_sample_evt' every bit period
-    ch->TDUV.B.TOV2  = (PERIOD - 1);
-
-    // Slice 0 (Bit Counter): Fires 'tdu_word_evt' after 26 events
-    // In 3x8 mode, Slice 0 generates tdu_word_evt when TO_CNT >= TOV [cite: 38]
-    ch->TDUV.B.TOV   = 26;
-
-    // -------------------------------------------------------------------------
-    // Start / Stop Logic
-    // -------------------------------------------------------------------------
-    // Start Behavior: Start on active edge. If stopped, RESTART on next active edge.
-    ch->ECTRL.B.TDU_START     = 0x7;   // 0b111 = Start/restart on active edge [cite: 806]
-    // Define "Active Edge" as Rising Edge
-    ch->CTRL.B.TOCTRL         = 0x1;   // 0x1 = Rising Edge only [cite: 240]
-
-
-    // Stop Behavior: Stop automatically when Bit Counter (Slice 0) hits limit.
-    // Slice 0 generates 'tdu_word_evt' (see Table 30 in manual).
-    ch->ECTRL.B.TDU_STOP      = 0x1;   // 0b001 = Stop on tdu_word_evt [cite: 806]
-
-    // Reset counters to 0 upon Start
-    ch->ECTRL.B.TDU_RESYNC    = 0xA;
-    ch->TDUC.B.TO_CNT = 0;
-    ch->TDUC.B.TO_CNT1 = 0;
-    ch->TDUC.B.TO_CNT2 = 0;
-    // -------------------------------------------------------------------------
-    // Interrupts
-    // -------------------------------------------------------------------------
-    // Map the "Done" event (tdu_word_evt) to the TODET interrupt [cite: 799]
-    ch->ECTRL.B.TODET_IRQ_SRC = 0x3;   // 0x1 = Use tdu_word_evt for TODET
-
-    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 0;
-    ch->IRQ.EN.B.TODET_IRQ_EN  = 1;    // Enable Timeout/Done interrupt
-    ch->IRQ.MODE.B.IRQ_MODE    = 0x2;  // Pulse mode
-
-    // Initialize SRC (Service Request Control)
-    IfxSrc_init(&SRC_GTM_TIM0_0, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH0_TODET);
-    IfxSrc_enable(&SRC_GTM_TIM0_0);
-
-    // 3. Enable Channel
-    ch->CTRL.B.TIM_EN = 1;
+    /*
+    // Enable NEWVAL interrupt for CH1
+    ch->IRQ.EN.B.NEWVAL_IRQ_EN = 1;
+    // Pulse-Notify mode is convenient (00 level, 01 pulse, 10 pulse-notify, 11 single-pulse)
+    ch->IRQ.MODE.B.IRQ_MODE = 0x2;
+    // Route to CPU0 with priority
+    IfxSrc_init(&SRC_GTM_TIM0_4, IfxSrc_Tos_cpu0, ISR_PRIORITY_TIM0_CH4_NEWVAL);
+    IfxSrc_enable(&SRC_GTM_TIM0_4);
+    */
 }
 
-static void initPins(void) {
-    IfxGtm_PinMap_setAtomTout(clock_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
-    IfxGtm_PinMap_setAtomTout(cmu_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
-    IfxGtm_PinMap_setAtomTout(dir_pin,   IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
-    IfxGtm_PinMap_setAtomTout(tx_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+static void initAtomSlaveSelect(void)
+{
+    Ifx_GTM_ATOM_CH *ch = atomCh(ss_pin->channel);
+    uint32 ticks = 26u * PERIOD;
+
+    ch->CTRL.B.MODE       = 2;   // SOMP
+    ch->CTRL.B.CLK_SRC_SR = 0;   // CMU_CLK0
+    ch->CTRL.B.OSM        = 1;   // one-shot
+    ch->CTRL.B.SL         = 1;   // pulse level HIGH (idle LOW)
+
+    ch->CTRL.B.RST_CCU0   = 0;   // must be 0 when using OSM_TRIG
+    ch->CTRL.B.OSM_TRIG   = 1;   // START one-shot on trigger
+    ch->CTRL.B.EXT_TRIG   = 1;   //signal TIM_EXT_CAPTURE[x] is selected
+
+    ch->CM1.U = ticks;       // time until second edge
+    ch->CM0.U = ticks + 1u;  // stop condition
+
+    agc->OUTEN_CTRL.B.OUTEN_CTRL5 = 2;
+    agc->GLB_CTRL.B.UPEN_CTRL5    = 0;
+    agc->ENDIS_CTRL.B.ENDIS_CTRL5 = 2;
+    agc->FUPD_CTRL.B.RSTCN0_CH5   = 2;
+
+    agc->GLB_CTRL.B.HOST_TRIG = 1;
+}
+
+static void initPins(void)
+{
+    IfxGtm_PinMap_setAtomTout(ss_pin, IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(tx_clk_pin,   IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(tx_pin,   IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(dir_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+    IfxGtm_PinMap_setAtomTout(rx_clk_pin,    IfxPort_OutputMode_pushPull, IfxPort_PadDriver_cmosAutomotiveSpeed1);
+
+    IfxGtm_PinMap_setTimTin(rx_pin, IfxPort_InputMode_pullDown);
 }
