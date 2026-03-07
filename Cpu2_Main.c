@@ -1,5 +1,5 @@
 /**********************************************************************************************************************
- * \file Cpu2_Main.c
+ * \file Cpu1_Main.c
  * \copyright Copyright (C) Infineon Technologies AG 2019
  * 
  * Use of this file is subject to the terms of use agreed between (i) you or the company in which ordinary course of 
@@ -28,6 +28,7 @@
 #include "IfxCpu.h"
 #include "IfxScuWdt.h"
 #include "Ifx_Cfg_Ssw.h"
+#include "MCMCAN.h"
 
 extern IfxCpu_syncEvent cpuSyncEvent;
 
@@ -35,7 +36,7 @@ void core2_main(void)
 {
     IfxCpu_enableInterrupts();
     
-    /* !!WATCHDOG2 IS DISABLED HERE!!
+    /* !!WATCHDOG1 IS DISABLED HERE!!
      * Enable the watchdog and service it periodically if it is required
      */
     IfxScuWdt_disableCpuWatchdog(IfxScuWdt_getCpuWatchdogPassword());
@@ -43,8 +44,13 @@ void core2_main(void)
     /* Wait for CPU sync event */
     IfxCpu_emitEvent(&cpuSyncEvent);
     IfxCpu_waitEvent(&cpuSyncEvent, 1);
-    
+
+    initMcmcan();
+    initLeds();
+
+
     while(1)
     {
+        transmitCanMessage();
     }
 }
