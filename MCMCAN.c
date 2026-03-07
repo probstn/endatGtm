@@ -14,14 +14,11 @@ void canIsrTxHandler(void)
     IfxPort_setPinLow(g_led1.port, g_led1.pinIndex);
 }
 
-/* Optional: enable onboard CAN transceiver if your board has STB pin */
 void enableCanTransceiver(void)
 {
-    /* Example for boards where standby is on P20.6.
-       Change this pin if your board uses another STB pin. */
     IfxPort_setPinModeOutput(&MODULE_P20, 6, IfxPort_OutputMode_pushPull,
                              IfxPort_OutputIdx_general);
-    IfxPort_setPinLow(&MODULE_P20, 6);   /* LOW = normal mode on many boards */
+    IfxPort_setPinLow(&MODULE_P20, 6);
 }
 
 void initMcmcan(void)
@@ -38,14 +35,11 @@ void initMcmcan(void)
 
     IfxCan_Can_initNodeConfig(&g_mcmcan.canNodeConfig, &g_mcmcan.canModule);
 
-    /* Real bus, not internal loopback */
     g_mcmcan.canNodeConfig.busLoopbackEnabled = FALSE;
     g_mcmcan.canNodeConfig.nodeId             = IfxCan_NodeId_0;
     g_mcmcan.canNodeConfig.frame.type         = IfxCan_FrameType_transmit;
     g_mcmcan.canNodeConfig.pins               = &canPins;
-
-    /* Bitrate: match this to your CAN analyzer / other node */
-    g_mcmcan.canNodeConfig.baudRate.baudrate = 1000000;
+    g_mcmcan.canNodeConfig.baudRate.baudrate  = 1000000;
 
     g_mcmcan.canNodeConfig.interruptConfig.transmissionCompletedEnabled = TRUE;
     g_mcmcan.canNodeConfig.interruptConfig.traco.priority              = ISR_PRIORITY_CAN_TX;
@@ -55,14 +49,14 @@ void initMcmcan(void)
     IfxCan_Can_initNode(&g_mcmcan.canSrcNode, &g_mcmcan.canNodeConfig);
 }
 
-void transmitCanMessage(void)
+void transmitCanPosition(uint32 pos20)
 {
     IfxCan_Can_initMessage(&g_mcmcan.txMsg);
 
-    g_mcmcan.txData[0] = TX_DATA_LOW_WORD;
-    g_mcmcan.txData[1] = TX_DATA_HIGH_WORD;
+    g_mcmcan.txData[0] = (pos20 & 0xFFFFFU);
+    g_mcmcan.txData[1] = 0U;
 
-    g_mcmcan.txMsg.messageId = CAN_MESSAGE_ID;
+    g_mcmcan.txMsg.messageId      = CAN_MESSAGE_ID;
     g_mcmcan.txMsg.dataLengthCode = IfxCan_DataLengthCode_8;
 
     while (IfxCan_Status_notSentBusy ==

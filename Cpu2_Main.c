@@ -29,28 +29,37 @@
 #include "IfxScuWdt.h"
 #include "Ifx_Cfg_Ssw.h"
 #include "MCMCAN.h"
+#include "intercore_mailbox.h"
 
 extern IfxCpu_syncEvent cpuSyncEvent;
 
-void core2_main(void)
+int core2_main(void)
 {
+    uint32 lastSeq = 0U;
+
     IfxCpu_enableInterrupts();
-    
-    /* !!WATCHDOG1 IS DISABLED HERE!!
-     * Enable the watchdog and service it periodically if it is required
-     */
-    IfxScuWdt_disableCpuWatchdog(IfxScuWdt_getCpuWatchdogPassword());
-    
-    /* Wait for CPU sync event */
-    IfxCpu_emitEvent(&cpuSyncEvent);
-    IfxCpu_waitEvent(&cpuSyncEvent, 1);
 
-    initMcmcan();
     initLeds();
+    enableCanTransceiver();
+    initMcmcan();
 
-
-    while(1)
+    while (1)
     {
-        transmitCanMessage();
+        if ((g_endatCanMailbox.valid != 0U) &&
+            (g_endatCanMailbox.seq != lastSeq))
+        {
+            uint32 seq;
+            uint32 pos;
+
+            __dsync();
+            seq = g_endatCanMailbox.seq;
+            pos = g_endatCanMailbox.pos20 & 0xFFFFFU;
+
+            lastSeq = seq;
+            g_endatCanMailbox.valid = 0U;
+            __dsync();
+
+            transmitCanPosition(pos);
+        }
     }
 }

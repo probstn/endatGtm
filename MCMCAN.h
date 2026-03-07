@@ -16,11 +16,8 @@
 #define INVALID_ID_VALUE            (uint32)0xFFFFFFFF
 #define ISR_PRIORITY_CAN_TX         2
 #define ISR_PRIORITY_CAN_RX         1
-#define TX_DATA_LOW_WORD            (uint32)0xC0CAC01A
-#define TX_DATA_HIGH_WORD           (uint32)0xBA5EBA11
 #define MAXIMUM_CAN_DATA_PAYLOAD    2
 
-/* CAN0 Node0 pins on many TC3xx TFT kits */
 #define CAN0_TXD                    IfxCan_TXD00_P20_8_OUT
 #define CAN0_RXD                    IfxCan_RXD00B_P20_7_IN
 
@@ -39,8 +36,8 @@ typedef struct
 } McmcanType;
 
 void initMcmcan(void);
-void transmitCanMessage(void);
+void transmitCanPosition(uint32 pos20);
 void initLeds(void);
 void enableCanTransceiver(void);
 
-#endif /* MCMCAN_H_ */
+#endif

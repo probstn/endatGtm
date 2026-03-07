@@ -12,6 +12,8 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <Qspi/SpiSlave/IfxQspi_SpiSlave.h>
+#include "intercore_mailbox.h"
+#include "IfxCpu.h"
 
 // ---------------------- CONFIGURATION & DEFINES (Moved to Top) ----------------------
 #define FREQUENCY   1e6
@@ -139,22 +141,29 @@ void init (void)
         if (spiWordReady)
         {
             spiWordReady = FALSE;
-            uint8_t error = (spiRxWord32 >> 1) & 0x1;
-            uint32_t pos = (spiRxWord32 >> 2) & 0x7FFFF;
-            uint8_t crc = (spiRxWord32 >> 21);
-            uint8_t crc_calc = MakeCrcPos(19, error, 0, 0, 0, pos);
+
+            uint8_t  error    = (uint8_t)((spiRxWord32 >> 1) & 0x1U);
+            uint32_t pos      = (uint32_t)((spiRxWord32 >> 2) & 0x7FFFFU);
+            uint8_t  crc      = (uint8_t)(spiRxWord32 >> 21);
+            uint8_t  crc_calc = (uint8_t)MakeCrcPos(19, error, 0, 0, 0, pos);
 
             if (crc == crc_calc)
             {
-                printf("%d\n", pos);
-                IfxStm_waitTicks(&MODULE_STM0, IfxStm_getTicksFromMilliseconds(&MODULE_STM0, 100));
+                printf("%lu\n", (unsigned long)pos);
+
+                g_endatCanMailbox.pos20 = pos & 0x7FFFFU;
+                g_endatCanMailbox.seq++;
+                __dsync();
+                g_endatCanMailbox.valid = 1U;
+                __dsync();
+
+                //IfxStm_waitTicks(&MODULE_STM0, IfxStm_getTicksFromMilliseconds(&MODULE_STM0, 100));
             }
             else
             {
                 printf("\tCRC ERR\n");
             }
 
-            // arm for next framed 26-bit word
             armSpiReceive26();
         }
     }
